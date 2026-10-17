@@ -1,0 +1,19 @@
+[package]
+name = "ru-sqlmux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+sqlformat = "0.5.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+toml = "1.1.8"
+tui-textarea = "0.7.0"
+
+# Complexity budget is enforced: clippy.toml sets the threshold to 7, and this
+# makes any function at 8 or more fail the build.
+[lints.clippy]
+cognitive_complexity = "deny"

@@ -1,0 +1,2 @@
+# Complexity budget: every function stays below 8, so the threshold is 7.
+cognitive-complexity-threshold = 7
