@@ -134,6 +134,8 @@ pub struct App {
     pub help: bool,
     /// database actually opened (shown in the sidebar title)
     label: String,
+    /// what the current connect attempt targets, for the form title
+    target: String,
     /// next frame must repaint every cell: the screen changed shape (form vs
     /// main UI) or the terminal was resized, and diffed painting would leave
     /// the previous screen showing through
@@ -171,58 +173,65 @@ impl App {
             err: String::new(),
             help: false,
             label: String::new(),
+            target: String::new(),
             need_clear: false,
         }
     }
 
     /// Kick off a connect on a background task; returns immediately so the form
-    /// stays visible and redraws while the server is contacted.
+    /// stays visible and redraws while the server is contacted. The DSN itself is
+    /// validated here, so a bad one fails at once instead of after a timeout.
     pub fn enqueue_connect(&mut self, dsn: &str) {
         if self.busy {
             return;
         }
-        let dsn = dsn.to_string();
         self.err.clear();
         self.msg.clear();
+        let conn = match Conn::from_dsn(dsn) {
+            Ok(conn) => conn,
+            Err(err) => {
+                self.err = format!("cannot connect: {err}");
+                self.focus = Focus::Form;
+                return;
+            }
+        };
+        self.target = target_label(&conn);
         self.busy = true;
         let tx = self.done_tx.clone();
         tokio::spawn(async move {
-            let done = match Conn::from_dsn(&dsn) {
+            let done = match Engine::connect(&conn).await {
                 Err(err) => Done::Failed(err),
-                Ok(conn) => match Engine::connect(&conn).await {
-                    Err(err) => Done::Failed(err),
-                    Ok(engine) => {
-                        let engine = Arc::new(engine);
-                        // show the database actually opened: Postgres falls back
-                        // to a DB named after the user when the DSN omits one
-                        let label = match conn.kind {
-                            crate::config::EngineKind::Sqlite => {
-                                conn.url.trim_start_matches("sqlite:").to_string()
-                            }
-                            _ => {
-                                let db = engine.db_label().await;
-                                if db.is_empty() {
-                                    conn.db_name.clone().unwrap_or_else(|| "?".into())
-                                } else {
-                                    db
-                                }
-                            }
-                        };
-                        let notice = (conn.db_name.is_none()
-                            && conn.kind != crate::config::EngineKind::Sqlite)
-                            .then(|| {
-                                format!(
-                                    "connected to `{label}`. The DSN has no /database name; add /<db> to it"
-                                )
-                            });
-                        match engine.tables().await {
-                            Ok(tables) => {
-                                Done::Connected { engine, tables, label, notice }
-                            }
-                            Err(err) => Done::Failed(format!("list tables: {err}")),
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    // show the database actually opened: Postgres falls back
+                    // to a DB named after the user when the DSN omits one
+                    let label = match conn.kind {
+                        crate::config::EngineKind::Sqlite => {
+                            conn.url.trim_start_matches("sqlite:").to_string()
                         }
+                        _ => {
+                            let db = engine.db_label().await;
+                            if db.is_empty() {
+                                conn.db_name.clone().unwrap_or_else(|| "?".into())
+                            } else {
+                                db
+                            }
+                        }
+                    };
+                    let notice = (conn.db_name.is_none()
+                        && conn.kind != crate::config::EngineKind::Sqlite)
+                        .then(|| {
+                            format!(
+                                "connected to `{label}`. The DSN has no /database name; add /<db> to it"
+                            )
+                        });
+                    match engine.tables().await {
+                        Ok(tables) => {
+                            Done::Connected { engine, tables, label, notice }
+                        }
+                        Err(err) => Done::Failed(format!("list tables: {err}")),
                     }
-                },
+                }
             };
             let _ = tx.send(done);
         });
@@ -449,7 +458,12 @@ impl App {
     }
 
     fn apply_failed(&mut self, err: String) {
-        self.err = err;
+        // still on the form: say plainly that the connection itself failed
+        self.err = if self.engine.is_none() && !err.starts_with("list tables") {
+            format!("cannot connect: {err}")
+        } else {
+            err
+        };
         if self.engine.is_none() {
             self.focus = Focus::Form;
         }
@@ -1042,8 +1056,12 @@ impl App {
     fn draw_form(&mut self, f: &mut Frame) {
         let area = centered(f.area(), 60, 6);
         f.render_widget(ratatui::widgets::Clear, area);
-        let title = if self.busy { "connecting… (8s budget)" } else { "connect dsn (Enter)" };
-        self.form_ta.set_block(ui::block(title, true));
+        let title = if self.busy {
+            format!("connecting to {} (8s budget)", self.target)
+        } else {
+            "connect dsn (Enter)".to_string()
+        };
+        self.form_ta.set_block(ui::block(&title, true));
         f.render_widget(&self.form_ta, area);
         let hint = if !self.err.is_empty() {
             Span::styled(self.err.clone(), Style::default().fg(Color::Red))
@@ -1245,6 +1263,17 @@ impl App {
         let area = centered(f.area(), 64, 18);
         f.render_widget(ratatui::widgets::Clear, area);
         f.render_widget(Paragraph::new(HELP).block(ui::block("keys", true)), area);
+    }
+}
+
+/// Human-readable target for the connect form title.
+fn target_label(conn: &Conn) -> String {
+    match conn.kind {
+        crate::config::EngineKind::Postgres => "postgres".into(),
+        crate::config::EngineKind::MySql => "mysql".into(),
+        crate::config::EngineKind::Sqlite => {
+            format!("sqlite {}", conn.url.trim_start_matches("sqlite:"))
+        }
     }
 }
 

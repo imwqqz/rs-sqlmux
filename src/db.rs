@@ -369,16 +369,33 @@ async fn sqlite_pool(conn: &crate::config::Conn) -> Result<sqlx::SqlitePool, Str
         SqliteConnectOptions::from_str("sqlite::memory:").map_err(e)?
     } else {
         let path = conn.path.clone().unwrap_or_else(|| ":memory:".into());
-        SqliteConnectOptions::new().filename(path).create_if_missing(true)
+        // a bare path must already exist (the parser checked); only an explicit
+        // sqlite: scheme may create the file
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(conn.create)
     };
     // one connection for :memory:, because a pool of five would open five
     // separate empty databases
     let max = if conn.memory { 1 } else { 5 };
-    sqlx::sqlite::SqlitePoolOptions::new()
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(max)
         .connect_with(opts)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    // A newly created file stays 0 bytes until something is written, and a 0
+    // byte file would be refused by the bare-path check on the next run. Writing
+    // the header here keeps the file a real database from the start.
+    if conn.create
+        && !conn.memory
+        && conn
+            .path
+            .as_ref()
+            .is_some_and(|p| std::fs::metadata(p).map(|m| m.len() == 0).unwrap_or(true))
+    {
+        let _ = sqlx::query("PRAGMA user_version = 0").execute(&pool).await;
+    }
+    Ok(pool)
 }
 
 impl Engine {
@@ -1427,16 +1444,53 @@ mod tests {
         let file = dir.join(format!("ru-sqlmux-test-{}.db", std::process::id()));
         let dsn = file.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&file);
+        assert!(crate::config::Conn::from_dsn(&dsn).is_err(), "missing file is refused");
+
+        // create a real database through the explicit scheme, then open it bare
+        let made = crate::config::Conn::from_dsn(&format!("sqlite://{dsn}")).unwrap();
+        let creator = Engine::connect(&made).await.unwrap();
+        script(
+            &creator,
+            "CREATE TABLE z (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO z (v) VALUES ('hi')",
+        )
+        .await;
+        drop(creator);
 
         let conn = crate::config::Conn::from_dsn(&dsn).unwrap();
         let e = Engine::connect(&conn).await.unwrap();
-        script(&e, "CREATE TABLE z (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO z (v) VALUES ('hi')")
-            .await;
         assert_eq!(e.tables().await.unwrap(), vec!["z"]);
         let cols = e.columns("z").await.unwrap();
         let page = e.fetch_page("z", &cols, None, 100, 0).await.unwrap();
         assert_eq!(page.rows[0][1], "hi");
         drop(e);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn sqlite_scheme_creates_a_real_file() {
+        // A file our own app creates must have a real header, otherwise the
+        // next bare-path open would refuse the file the app just made.
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("ru-sqlmux-new-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let dsn = file.to_string_lossy().to_string();
+
+        let made = crate::config::Conn::from_dsn(&format!("sqlite://{dsn}")).unwrap();
+        assert!(made.create);
+        let engine = Engine::connect(&made).await.unwrap();
+        assert!(engine.tables().await.unwrap().is_empty());
+        drop(engine);
+
+        let len = std::fs::metadata(&file).unwrap().len();
+        assert!(len >= 16, "created database should carry the sqlite header, got {len} bytes");
+
+        // and it opens again through a bare path
+        let bare = crate::config::Conn::from_dsn(&dsn).unwrap();
+        assert!(!bare.create);
+        let reopened = Engine::connect(&bare).await.unwrap();
+        assert!(reopened.tables().await.unwrap().is_empty());
+        drop(reopened);
 
         let _ = std::fs::remove_file(&file);
     }
