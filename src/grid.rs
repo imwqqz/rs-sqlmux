@@ -224,3 +224,52 @@ pub fn render(
     st.table_state.select(Some(st.sel.0));
     f.render_stateful_widget(table, area, &mut st.table_state);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the selection must stay inside the window; a regression only shows on screen
+    fn inside(win: (usize, usize), sel: usize) -> bool {
+        win.0 <= sel && sel < win.1 && win.1 > win.0
+    }
+
+    #[test]
+    fn a_wide_budget_keeps_every_column_and_the_selection() {
+        let widths = [5, 5, 5];
+        assert_eq!(fit_forward(&widths, 100, 0), (0, 3));
+        assert!(inside(pick_window(&widths, 100, 2, 0), 2));
+    }
+
+    #[test]
+    fn a_selection_right_of_the_window_slides_forward_into_view() {
+        let widths = [10, 10, 10, 10];
+        let win = pick_window(&widths, 10, 3, 0); // budget fits one column; select the 4th
+        assert_eq!(win, (3, 4));
+        assert!(inside(win, 3));
+    }
+
+    #[test]
+    fn a_selection_left_of_the_window_slides_back_into_view() {
+        let widths = [10, 10, 10, 10];
+        let win = pick_window(&widths, 10, 0, 3);
+        assert_eq!(win, (0, 1));
+        assert!(inside(win, 0));
+    }
+
+    #[test]
+    fn a_column_wider_than_the_budget_still_shows_and_covers_itself() {
+        let widths = [40, 5];
+        let win = pick_window(&widths, 10, 0, 0); // column 0 alone exceeds the budget
+        assert_eq!(win, (0, 1));
+        assert!(inside(win, 0));
+    }
+
+    #[test]
+    fn the_last_column_is_reachable() {
+        let widths = [5, 5, 5];
+        let win = pick_window(&widths, 10, 2, 0);
+        assert!(inside(win, 2), "{win:?}");
+        assert!(win.1 <= widths.len());
+    }
+}

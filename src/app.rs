@@ -15,9 +15,11 @@ const NONE_SORT: usize = usize::MAX;
 const HELP: &str = r#"
  TAB        cycle focus (sidebar → grid → SQL → results)
  ?          this help          C-c quit
+ C-g        stop a running job (a stopped save usually rolls back)
  Sidebar    j/k move  / filter  Enter open  Esc clear filter
  Grid       h/l j/k move  g/G start/end  [ ] page  s sort column
             e edit cell  o insert row  d (un)delete row
+            in the cell editor: :null writes NULL, an empty value writes ''
             C-s save all as one transaction  R refresh
  SQL        Enter run  Alt-Enter newline  Alt-Up/Down history
  Results    j/k scroll  Enter back to grid
@@ -106,9 +108,18 @@ pub enum Done {
 pub struct App {
     form_ta: TextArea<'static>,
     pub engine: Option<Arc<Engine>>,
-    done_tx: tokio::sync::mpsc::UnboundedSender<Done>,
+    done_tx: tokio::sync::mpsc::UnboundedSender<(u64, Done)>,
     /// a background job is in flight (status line shows a spinner)
     pub busy: bool,
+    /// when the in-flight job started, for the stall watchdog
+    busy_since: Option<std::time::Instant>,
+    /// the in-flight job, kept so the user can stop it
+    job: Option<tokio::task::JoinHandle<()>>,
+    /// current job id; a result with a stale id is dropped
+    job_id: u64,
+    job_seq: u64,
+    /// why the last key was refused; drawn only while `busy`
+    busy_note: String,
     tables: Vec<String>,
     /// Some(text) while the sidebar filter is being typed
     filt_in: Option<String>,
@@ -143,7 +154,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(done_tx: tokio::sync::mpsc::UnboundedSender<Done>) -> Self {
+    pub fn new(done_tx: tokio::sync::mpsc::UnboundedSender<(u64, Done)>) -> Self {
         let mut form_ta = TextArea::default();
         form_ta.set_placeholder_text("postgres://… · mysql://… · ./file.db  (Enter connect, C-c quit)");
         Self {
@@ -151,6 +162,11 @@ impl App {
             engine: None,
             done_tx,
             busy: false,
+            busy_since: None,
+            job: None,
+            job_id: 0,
+            job_seq: 0,
+            busy_note: String::new(),
             tables: Vec::new(),
             filt_in: None,
             filtered: Vec::new(),
@@ -178,11 +194,76 @@ impl App {
         }
     }
 
+    // run the job under the query budget; always report back, keep the handle
+    fn spawn_job(&mut self, fut: impl std::future::Future<Output = Done> + Send + 'static) {
+        self.busy = true;
+        self.busy_since = Some(std::time::Instant::now());
+        self.busy_note.clear();
+        let id = self.fresh_job_id();
+        let budget = db::QUERY_BUDGET;
+        let tx = self.done_tx.clone();
+        let handle = tokio::spawn(async move {
+            let done = match tokio::time::timeout(budget, fut).await {
+                Ok(done) => done,
+                Err(_) => Done::Failed(format!(
+                    "job timed out ({}s): the server may still be working on it",
+                    budget.as_secs()
+                )),
+            };
+            let _ = tx.send((id, done));
+        });
+        self.job = Some(handle);
+    }
+
+    // new job id; also invalidates a stopped job's late result
+    fn fresh_job_id(&mut self) -> u64 {
+        let id = self.job_seq;
+        self.job_seq += 1;
+        self.job_id = id;
+        id
+    }
+
+    fn refuse(&mut self, what: &str) {
+        self.busy_note = format!("{what}: wait, or C-g to stop");
+    }
+
+    // drop the job's future; a stopped save usually rolls back
+    fn abort_job(&mut self) {
+        if let Some(handle) = self.job.take() {
+            handle.abort();
+        }
+        self.fresh_job_id();
+        self.busy = false;
+        self.busy_since = None;
+    }
+
+    // C-g stop (sqlmux grid.stop: https://github.com/kackerx/sqlmux)
+    fn stop_job(&mut self) {
+        self.abort_job();
+        self.busy_note.clear();
+        self.msg = "stopped".into();
+    }
+
+    // watchdog: a job that stopped reporting must not block the UI
+    pub fn tick(&mut self) {
+        const SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+        if self
+            .busy_since
+            .is_some_and(|t0| t0.elapsed() > db::QUERY_BUDGET + SLACK)
+        {
+            self.abort_job();
+            self.err =
+                "a background job stopped reporting; the connection may be stuck — reconnect or restart"
+                    .into();
+        }
+    }
+
     /// Kick off a connect on a background task; returns immediately so the form
     /// stays visible and redraws while the server is contacted. The DSN itself is
     /// validated here, so a bad one fails at once instead of after a timeout.
     pub fn enqueue_connect(&mut self, dsn: &str) {
         if self.busy {
+            self.refuse("still connecting");
             return;
         }
         self.err.clear();
@@ -196,44 +277,37 @@ impl App {
             }
         };
         self.target = target_label(&conn);
-        self.busy = true;
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = match Engine::connect(&conn).await {
-                Err(err) => Done::Failed(err),
-                Ok(engine) => {
-                    let engine = Arc::new(engine);
-                    // show the database actually opened: Postgres falls back
-                    // to a DB named after the user when the DSN omits one
-                    let label = match conn.kind {
-                        crate::config::EngineKind::Sqlite => {
-                            conn.url.trim_start_matches("sqlite:").to_string()
-                        }
-                        _ => {
-                            let db = engine.db_label().await;
-                            if db.is_empty() {
-                                conn.db_name.clone().unwrap_or_else(|| "?".into())
-                            } else {
-                                db
-                            }
-                        }
-                    };
-                    let notice = (conn.db_name.is_none()
-                        && conn.kind != crate::config::EngineKind::Sqlite)
-                        .then(|| {
-                            format!(
-                                "connected to `{label}`. The DSN has no /database name; add /<db> to it"
-                            )
-                        });
-                    match engine.tables().await {
-                        Ok(tables) => {
-                            Done::Connected { engine, tables, label, notice }
-                        }
-                        Err(err) => Done::Failed(format!("list tables: {err}")),
+        self.spawn_job(async move {
+            let engine = match Engine::connect(&conn).await {
+                Err(err) => return Done::Failed(err),
+                Ok(engine) => Arc::new(engine),
+            };
+            // show the database actually opened: Postgres falls back to a DB
+            // named after the user when the DSN omits one
+            let label = match conn.kind {
+                crate::config::EngineKind::Sqlite => {
+                    conn.url.trim_start_matches("sqlite:").to_string()
+                }
+                _ => {
+                    let db = engine.db_label().await;
+                    if db.is_empty() {
+                        conn.db_name.clone().unwrap_or_else(|| "?".into())
+                    } else {
+                        db
                     }
                 }
             };
-            let _ = tx.send(done);
+            let notice = (conn.db_name.is_none()
+                && conn.kind != crate::config::EngineKind::Sqlite)
+                .then(|| {
+                    format!(
+                        "connected to `{label}`. The DSN has no /database name; add /<db> to it"
+                    )
+                });
+            match engine.tables().await {
+                Ok(tables) => Done::Connected { engine, tables, label, notice },
+                Err(err) => Done::Failed(format!("list tables: {err}")),
+            }
         });
     }
 
@@ -254,39 +328,33 @@ impl App {
     fn enqueue_open(&mut self, name: &str) {
         let Some(engine) = self.engine.clone() else { return };
         if self.busy {
+            self.refuse("still loading");
             return;
         }
         self.err.clear();
-        self.busy = true;
         let name = name.to_string();
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = fetch_open(&engine, &name, 0, None).await;
-            let _ = tx.send(done);
-        });
+        self.spawn_job(async move { fetch_open(&engine, &name, 0, None).await });
     }
 
     /// Fetch the current page of the current table with the current sort.
     fn enqueue_page(&mut self) {
         let (Some(engine), Some(td)) = (self.engine.clone(), self.td.clone()) else { return };
         if self.busy {
+            self.refuse("still loading");
             return;
         }
         self.err.clear();
-        self.busy = true;
         let order = if self.sort_col == NONE_SORT {
             None
         } else {
             Some((td.cols[self.sort_col].name.clone(), self.sort_desc))
         };
         let page = self.page;
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = match fetch_open(&engine, &td.name, page, order).await {
+        self.spawn_job(async move {
+            match fetch_open(&engine, &td.name, page, order).await {
                 Done::Opened(p) => Done::Page { rows: p.td.rows, total: p.total, approx: p.approx },
                 other => other,
-            };
-            let _ = tx.send(done);
+            }
         });
     }
 
@@ -295,24 +363,23 @@ impl App {
         let engine = self.engine.clone();
         let Some(engine) = engine else { return };
         if self.busy {
+            self.refuse("still loading");
             return;
         }
         self.err.clear();
-        self.busy = true;
         let reopen = self.td.as_ref().map(|td| td.name.clone());
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = match engine.tables().await {
-                Err(err) => Done::Failed(format!("list tables: {err}")),
-                Ok(tables) => match reopen {
-                    None => Done::Refreshed { tables, opened: None },
-                    Some(name) => match fetch_open(&engine, &name, 0, None).await {
-                        Done::Opened(opened) => Done::Refreshed { tables, opened: Some(opened) },
-                        other => other,
-                    },
-                },
+        self.spawn_job(async move {
+            let tables = match engine.tables().await {
+                Err(err) => return Done::Failed(format!("list tables: {err}")),
+                Ok(tables) => tables,
             };
-            let _ = tx.send(done);
+            match reopen {
+                None => Done::Refreshed { tables, opened: None },
+                Some(name) => match fetch_open(&engine, &name, 0, None).await {
+                    Done::Opened(opened) => Done::Refreshed { tables, opened: Some(opened) },
+                    other => other,
+                },
+            }
         });
     }
 
@@ -345,9 +412,12 @@ impl App {
         self.enqueue_page();
     }
 
-    /// Apply a finished background job to the UI state.
+    // current job finished: apply it and clear the busy state
     pub fn apply(&mut self, done: Done) {
         self.busy = false;
+        self.busy_since = None;
+        self.job = None;
+        self.busy_note.clear();
         let was_connected = self.engine.is_some();
         match done {
             Done::Connected { engine, tables, label, notice } => {
@@ -365,6 +435,13 @@ impl App {
         if was_connected != self.engine.is_some() {
             // form and main UI occupy different shapes; repaint from scratch
             self.need_clear = true;
+        }
+    }
+
+    // drop a result whose job is no longer current (stopped, or already replaced)
+    pub fn apply_job(&mut self, id: u64, done: Done) {
+        if id == self.job_id {
+            self.apply(done);
         }
     }
 
@@ -561,8 +638,8 @@ impl App {
             .cloned()
             .unwrap_or_default();
         let m = self.pending.edits.entry(pk.clone()).or_default();
-        if new == col_orig {
-            // reverted: drop the entry; empty maps cleaned at save
+        // empty commits '' (NULL and '' look the same in the grid); Esc cancels; :null means a real NULL
+        if new == col_orig && !new.is_empty() {
             m.remove(&col_name);
             if m.is_empty() {
                 self.pending.edits.remove(&pk);
@@ -602,15 +679,16 @@ impl App {
     }
 
     fn enqueue_save(&mut self) {
+        if self.busy {
+            self.refuse("a save or query is still running");
+            return;
+        }
         self.err.clear();
         let Some(engine) = self.engine.clone() else { return };
         let Some(td) = self.td.as_ref() else { return };
         let Some((_, pk_name)) = self.editable_pk() else {
             return;
         };
-        if self.busy {
-            return;
-        }
         let edits: Vec<Edit> = self
             .pending
             .edits
@@ -645,10 +723,8 @@ impl App {
             .collect();
         let consumed_dels = dels.clone();
         let consumed_ghosts = inserts.len();
-        self.busy = true;
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = match engine.save(&name, &pk_name, &edits, &dels, &inserts).await {
+        self.spawn_job(async move {
+            match engine.save(&name, &pk_name, &edits, &dels, &inserts).await {
                 Ok(rep) => Done::Saved {
                     msg: format!(
                         "saved: {} updates, {} deletes{}",
@@ -665,27 +741,23 @@ impl App {
                     ghosts: consumed_ghosts,
                 },
                 Err(err) => Done::Failed(err),
-            };
-            let _ = tx.send(done);
+            }
         });
     }
 
     fn enqueue_run_sql(&mut self, sql: &str) {
         let Some(engine) = self.engine.clone() else { return };
         if self.busy {
-            self.msg = "busy: a query is still running".into();
+            self.refuse("a statement is still running");
             return;
         }
         self.err.clear();
-        self.busy = true;
         let sql = sql.to_string();
-        let tx = self.done_tx.clone();
-        tokio::spawn(async move {
-            let done = match engine.run_sql(&sql).await {
+        self.spawn_job(async move {
+            match engine.run_sql(&sql).await {
                 Ok(rr) => Done::Sql(rr),
                 Err(err) => Done::Failed(err),
-            };
-            let _ = tx.send(done);
+            }
         });
     }
 
@@ -774,6 +846,11 @@ impl App {
     fn global_key(&mut self, k: &KeyEvent) -> GlobalKey {
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => GlobalKey::Quit,
+            // stop a job that is still running (sqlmux's grid.stop)
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) if self.busy => {
+                self.stop_job();
+                GlobalKey::Handled
+            }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.enqueue_save();
                 GlobalKey::Handled
@@ -1188,7 +1265,15 @@ impl App {
         let left = format!("{}{}  ? help  C-s save  Tab", self.focus_name(), self.pending_summary());
         let txt = Line::from(vec![
             if self.busy {
-                Span::styled("⏳ loading…  ", Style::default().fg(Color::Yellow))
+                let note = if self.busy_note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", self.busy_note)
+                };
+                Span::styled(
+                    format!("⏳ loading…{note}  "),
+                    Style::default().fg(Color::Yellow),
+                )
             } else {
                 Span::raw("")
             },
@@ -1286,6 +1371,16 @@ fn centered(r: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
+/// The row identity: only a single-column pk is editable, so a composite key
+/// stays read-only instead of matching rows on the first column alone.
+fn pk_index(cols: &[db::Col]) -> Option<usize> {
+    let mut pks = cols.iter().enumerate().filter(|(_, c)| c.pk).map(|(i, _)| i);
+    match (pks.next(), pks.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
+}
+
 /// Catalogue + first/next page + best count for one table; runs on a task.
 async fn fetch_open(
     engine: &Arc<Engine>,
@@ -1297,7 +1392,7 @@ async fn fetch_open(
         Ok(c) => c,
         Err(err) => return Done::Failed(format!("columns({name}): {err}")),
     };
-    let pk_idx = cols.iter().position(|c| c.pk);
+    let pk_idx = pk_index(&cols);
     for c in &mut cols {
         c.pk = false;
     }
@@ -1380,6 +1475,84 @@ mod tests {
 
         // kept, and compared against what the server now holds ("first")
         assert_eq!(app.pending.edits["1"]["name"], ("first".to_string(), "second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_leaves_no_sticky_message() {
+        let mut app = app_with_row();
+        app.busy = true;
+        app.refuse("a statement is still running");
+        assert!(app.busy_note.contains("still running"));
+
+        app.apply(Done::Failed("boom".into()));
+        assert!(!app.busy);
+        assert!(app.busy_note.is_empty(), "the note must not outlive the job");
+        assert!(!app.msg.contains("still running"), "and not reach the status line");
+    }
+
+    #[tokio::test]
+    async fn spawn_job_reports_and_clears_the_handle() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.spawn_job(async { Done::Failed("boom".into()) });
+        assert!(app.busy && app.job.is_some() && app.busy_since.is_some());
+
+        let (id, done) = rx.recv().await.unwrap();
+        app.apply_job(id, done);
+        assert!(!app.busy && app.job.is_none() && app.busy_since.is_none());
+        assert!(app.err.contains("boom"), "{}", app.err);
+    }
+
+    #[tokio::test]
+    async fn c_g_stops_a_job_and_clears_the_flags() {
+        let mut app = app_with_row();
+        app.busy = true;
+        app.busy_since = Some(std::time::Instant::now());
+        app.refuse("a save is still running");
+
+        app.stop_job();
+        assert!(!app.busy && app.busy_since.is_none() && app.job.is_none());
+        assert!(app.busy_note.is_empty(), "the refusal note goes with the job");
+        assert_eq!(app.msg, "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_jobs_result_cannot_clear_the_next_job() {
+        let mut app = app_with_row();
+        let stale = app.fresh_job_id(); // the job the user stops
+        app.busy = true;
+        app.busy_since = Some(std::time::Instant::now());
+        app.abort_job();
+        app.busy = true; // the next job takes a newer id
+        app.busy_since = Some(std::time::Instant::now());
+
+        app.apply_job(stale, Done::Failed("late".into()));
+        assert!(app.busy, "a late result must not touch the newer job");
+        assert!(!app.err.contains("late"), "{}", app.err);
+    }
+
+    #[test]
+    fn a_composite_pk_is_read_only() {
+        let pk = |name: &str| db::Col { name: name.into(), data_type: "int".into(), pk: true };
+        let npk = || db::Col { name: "v".into(), data_type: "int".into(), pk: false };
+        assert_eq!(pk_index(&[]), None);
+        assert_eq!(pk_index(&[npk()]), None, "no pk at all");
+        assert_eq!(pk_index(&[pk("a"), npk()]), Some(0));
+        assert_eq!(pk_index(&[npk(), pk("a"), pk("b")]), None, "composite key");
+    }
+
+    #[tokio::test]
+    async fn a_job_that_stopped_reporting_does_not_block_forever() {
+        let mut app = app_with_row();
+        app.busy = true;
+        app.busy_since = Some(
+            std::time::Instant::now() - db::QUERY_BUDGET - std::time::Duration::from_secs(10),
+        );
+
+        app.tick();
+        assert!(!app.busy, "the watchdog must clear a latch");
+        assert!(app.busy_since.is_none());
+        assert!(app.err.contains("stuck"), "{}", app.err);
     }
 
     #[tokio::test]

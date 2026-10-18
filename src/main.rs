@@ -92,11 +92,13 @@ async fn main() -> std::io::Result<()> {
 async fn run(
     mut terminal: ratatui::Terminal<CrosstermBackend<Stdout>>,
     rx: Receiver<Event>,
-    mut done_rx: tokio::sync::mpsc::UnboundedReceiver<app::Done>,
+    mut done_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, app::Done)>,
     app: &mut App,
 ) {
     loop {
         apply_jobs(&mut done_rx, app);
+        // backstop: a job that stopped reporting must not block the UI
+        app.tick();
         // a mode change or resize needs every cell repainted, not a diff
         if app.need_clear {
             app.need_clear = false;
@@ -112,10 +114,13 @@ async fn run(
     }
 }
 
-/// Drain finished background jobs into the UI state.
-fn apply_jobs(done_rx: &mut tokio::sync::mpsc::UnboundedReceiver<app::Done>, app: &mut App) {
-    while let Ok(done) = done_rx.try_recv() {
-        app.apply(done);
+// drain finished jobs; a stale result (its job was replaced) is dropped
+fn apply_jobs(
+    done_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, app::Done)>,
+    app: &mut App,
+) {
+    while let Ok((id, done)) = done_rx.try_recv() {
+        app.apply_job(id, done);
     }
 }
 

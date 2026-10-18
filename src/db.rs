@@ -270,26 +270,31 @@ fn pg_cast_sql(names: &[String], sql: &str) -> String {
 }
 
 async fn mysql_query_rows(p: &sqlx::MySqlPool, sql: &str, kw: &str) -> Result<RunResult, String> {
-    let cap = if kw == "select" || kw == "with" {
-        format!("{sql} LIMIT {CONSOLE_ROW_CAP}")
+    let capped = if kw == "select" || kw == "with" {
+        cap_select(sql)
     } else {
         sql.to_string()
     };
-    let rs = qs!(&cap).fetch_all(p).await.map_err(e)?;
+    let rs = qs!(&capped).fetch_all(p).await.map_err(e)?;
     Ok(RunResult { cols: cols_my(&rs), rows: decode_my(&rs), ok: None })
 }
 
 async fn sqlite_query_rows(p: &sqlx::SqlitePool, sql: &str, kw: &str) -> Result<RunResult, String> {
-    let cap = if matches!(kw, "select" | "with" | "table" | "values") {
-        format!("{sql} LIMIT {CONSOLE_ROW_CAP}")
+    let capped = if matches!(kw, "select" | "with" | "table" | "values") {
+        cap_select(sql)
     } else {
         sql.to_string()
     };
-    let rs = qs!(&cap).fetch_all(p).await.map_err(e)?;
+    let rs = qs!(&capped).fetch_all(p).await.map_err(e)?;
     Ok(RunResult { cols: cols_li(&rs), rows: decode_li(&rs), ok: None })
 }
 
 const CONSOLE_ROW_CAP: usize = 500;
+
+// cap rows by wrapping: appending LIMIT turns "... LIMIT 1" into a syntax error
+fn cap_select(sql: &str) -> String {
+    format!("SELECT * FROM ({sql}) AS capped LIMIT {CONSOLE_ROW_CAP}")
+}
 
 /// Cell text for a NULL is the empty string grid-wide.
 fn cell(row: Option<String>) -> String {
@@ -302,47 +307,74 @@ enum Scan {
     Code,
     Single,
     Double,
-    Comment,
+    LineComment,
+    BlockComment,
 }
 
-/// One character of the scan. `n` counts statements finished at this character.
-fn scan_step(st: Scan, c: char, n: &mut usize) -> Scan {
-    match st {
-        Scan::Comment => if c == '\n' { Scan::Code } else { Scan::Comment },
-        Scan::Single => if c == '\'' { Scan::Code } else { Scan::Single },
-        Scan::Double => if c == '"' { Scan::Code } else { Scan::Double },
-        Scan::Code => match c {
-            '\'' => Scan::Single,
-            '"' => Scan::Double,
-            ';' => {
-                *n += 1;
-                Scan::Code
-            }
-            _ => Scan::Code,
-        },
-    }
-}
-
-/// Count top-level statements: semicolons outside quotes and line comments.
-/// The console runs one statement, so anything above 1 is refused up front with
-/// a message the user can act on.
-fn statement_count(sql: &str) -> usize {
+// top-level statement count: the console runs one, so >1 is refused.
+// escapes is MySQL only, where \' does not close a string.
+fn statement_count(sql: &str, escapes: bool) -> usize {
     let mut n = 1;
     let mut st = Scan::Code;
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
-        // "--" opens a comment; the second dash is handled by the Comment state
-        if st == Scan::Code && c == '-' && chars.peek() == Some(&'-') {
-            st = Scan::Comment;
+        st = comment_step(st, c, &mut chars);
+        if matches!(st, Scan::LineComment | Scan::BlockComment) {
+            continue; // a semicolon in here does not count
+        }
+        if escapes && in_string(st) && c == '\\' {
+            chars.next(); // the escaped character cannot close the string
             continue;
         }
-        st = scan_step(st, c, &mut n);
+        st = code_step(st, c, &mut n);
     }
     n
 }
 
+fn in_string(st: Scan) -> bool {
+    matches!(st, Scan::Single | Scan::Double)
+}
+
+// comments own the lookahead: /* */ and -- are the only two-character tokens
+fn comment_step(st: Scan, c: char, chars: &mut std::iter::Peekable<std::str::Chars>) -> Scan {
+    match (st, c) {
+        (Scan::Code, '/') if chars.peek() == Some(&'*') => {
+            chars.next();
+            Scan::BlockComment
+        }
+        (Scan::BlockComment, '*') if chars.peek() == Some(&'/') => {
+            chars.next();
+            Scan::Code
+        }
+        (Scan::Code, '-') if chars.peek() == Some(&'-') => {
+            chars.next();
+            Scan::LineComment
+        }
+        (Scan::LineComment, '\n') => Scan::Code,
+        (other, _) => other,
+    }
+}
+
+// quotes open and close a string; a top-level ; ends a statement
+fn code_step(st: Scan, c: char, n: &mut usize) -> Scan {
+    match (st, c) {
+        (Scan::Code, '\'') => Scan::Single,
+        (Scan::Code, '"') => Scan::Double,
+        (Scan::Code, ';') => {
+            *n += 1;
+            Scan::Code
+        }
+        (Scan::Single, '\'') | (Scan::Double, '"') => Scan::Code,
+        (other, _) => other,
+    }
+}
+
 /// Connection budget shared by the three pool builders.
 const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+// one job's wall clock: dropping the future returns the pooled connection,
+// but the server may still finish the statement
+pub const QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn pg_pool(url: &str) -> Result<sqlx::PgPool, String> {
     sqlx::postgres::PgPoolOptions::new()
@@ -608,7 +640,7 @@ impl Engine {
         if sql.is_empty() {
             return Ok(RunResult { cols: vec![], rows: vec![], ok: Some(String::new()) });
         }
-        if statement_count(sql) > 1 {
+        if statement_count(sql, self.kind() == EngineKind::MySql) > 1 {
             return Err(
                 "one statement at a time: split on the semicolon and run each part".into(),
             );
@@ -687,11 +719,12 @@ fn check_sql(k: EngineKind, t: &str, col: &str, pkc: &str, pk: &str) -> String {
     )
 }
 
+// :null emits a bare NULL; the grid shows NULL and '' the same way
 fn update_sql(k: EngineKind, t: &str, col: &str, new: &str, pkc: &str, pk: &str) -> String {
+    let v = if new == ":null" { "NULL".to_string() } else { quote_literal(new) };
     format!(
         "UPDATE {t} SET {c} = {v} WHERE {pred}",
         c = ident(k, col),
-        v = quote_literal(new),
         pred = pk_pred(pkc, pk)
     )
 }
@@ -1404,13 +1437,52 @@ mod tests {
 
     #[test]
     fn statement_scan() {
-        assert_eq!(statement_count("select 1"), 1);
-        assert_eq!(statement_count("select ';'"), 1);
-        assert_eq!(statement_count("select 1; select 2"), 2);
-        assert_eq!(statement_count("select 1 -- ; ignored\n"), 1);
-        assert_eq!(statement_count(r#"select "a;b""#), 1);
+        assert_eq!(statement_count("select 1", false), 1);
+        assert_eq!(statement_count("select ';'", false), 1);
+        assert_eq!(statement_count("select 1; select 2", false), 2);
+        assert_eq!(statement_count("select 1 -- ; ignored\n", false), 1);
+        assert_eq!(statement_count(r#"select "a;b""#, false), 1);
         // a trailing semicolon counts, and run_sql strips it before counting
-        assert_eq!(statement_count("select 1;"), 2);
+        assert_eq!(statement_count("select 1;", false), 2);
+    }
+
+    #[test]
+    fn statement_scan_ignores_comments() {
+        assert_eq!(statement_count("select 1 /* a ; b */", false), 1);
+        assert_eq!(statement_count("select 1; /* x */ select 2", false), 2);
+        // a quote cannot open a comment: a -- inside a string is text
+        assert_eq!(statement_count("select '--'", false), 1);
+    }
+
+    #[test]
+    fn statement_scan_escapes_only_on_mysql() {
+        assert_eq!(statement_count(r"select 'it\'s; x'", true), 1);
+        assert_eq!(statement_count(r"select 'it\'s; x'", false), 2);
+    }
+
+    #[test]
+    fn a_select_cap_wraps_and_keeps_a_user_limit() {
+        let capped = cap_select("SELECT id FROM t LIMIT 1");
+        assert!(capped.contains("(SELECT id FROM t LIMIT 1) AS capped"), "{capped}");
+        assert!(capped.ends_with(&format!("LIMIT {CONSOLE_ROW_CAP}")), "{capped}");
+    }
+
+    #[test]
+    fn a_null_token_writes_a_bare_null() {
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", ":null", "id", "1");
+        assert!(sql.contains("= NULL"), "{sql}");
+        assert!(!sql.contains("':null'"), "{sql}");
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", "x", "id", "1");
+        assert!(sql.contains("= 'x'"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn a_select_with_a_user_limit_run_from_the_console() {
+        let e = mem().await;
+        // the old append path made this "... LIMIT 1 LIMIT 500": a syntax error
+        let r = e.run_sql("SELECT id FROM t LIMIT 1").await.unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], "1");
     }
 
     #[tokio::test]
