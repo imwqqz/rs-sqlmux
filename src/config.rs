@@ -3,9 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Real SQLite files start with this 16 byte header. A zero byte file, a text
-/// file, or anything else is not a database, so a bare path to one is refused
-/// instead of being opened as a blank database.
+/// A file without this header is not a database, so a bare path to it is refused.
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 fn looks_like_sqlite(path: &Path) -> bool {
@@ -16,11 +14,29 @@ fn looks_like_sqlite(path: &Path) -> bool {
     file.read_exact(&mut head).is_ok() && &head == SQLITE_MAGIC
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct ConnDef {
     pub dsn: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<bool>,
+    /// Refuses cell saves and non-row SQL from the console.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readonly: Option<bool>,
+    /// Wall clock for one background job, in seconds (default 30).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_timeout: Option<u64>,
+}
+
+impl ConnDef {
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.unwrap_or(false)
+    }
+
+    /// A profile that sets 0 would time out every job, so the floor is one second.
+    pub fn timeout(&self) -> std::time::Duration {
+        let secs = self.query_timeout.unwrap_or(crate::db::QUERY_BUDGET.as_secs());
+        std::time::Duration::from_secs(secs.max(1))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -36,30 +52,22 @@ pub enum EngineKind {
     Sqlite,
 }
 
-/// DSN + resolved engine kind. A bare path opens an existing SQLite file;
-/// `sqlite:`/`sqlite://` may create a new one. `env:VAR` segments are expanded
-/// from the process environment (e.g. password).
+/// DSN plus resolved engine; `env:VAR` segments are expanded from the environment.
 #[derive(Clone, Debug)]
 pub struct Conn {
     pub kind: EngineKind,
     pub url: String,
-    /// sqlite only: filesystem path (kept separate from `url` so Windows drive
-    /// letters never go through URL parsing) and whether it is `:memory:`.
+    /// SQLite only; kept out of `url` so Windows drive letters never go through URL parsing.
     pub path: Option<PathBuf>,
     pub memory: bool,
-    /// sqlite only: the user named the file explicitly (`sqlite:` scheme), so a
-    /// missing file may be created. A bare path must already exist, otherwise a
-    /// typo would silently invent an empty database.
+    /// SQLite only: only a `sqlite:` DSN may create the file, so a typo in a
+    /// bare path cannot invent a database.
     pub create: bool,
-    /// server only: database name from the DSN path, when one was given
     pub db_name: Option<String>,
 }
 
 impl Conn {
-    /// Parse a user-supplied DSN with optional `env:VAR` expansion markers.
-    /// `env:NAME` is replaced with the process env value (passwords, hosts).
-    /// Rejects incomplete server DSNs and bare paths that do not exist, so the
-    /// caller can report a real failure instead of opening an empty database.
+    /// Parses a DSN, expands `env:VAR`, and refuses a server DSN or bare path that cannot open.
     pub fn from_dsn(dsn: &str) -> Result<Self, String> {
         let dsn = expand_env(dsn)?;
         let dsn = dsn.trim();
@@ -71,17 +79,14 @@ impl Conn {
         } else if dsn.starts_with("mysql://") {
             EngineKind::MySql
         } else if dsn.starts_with("sqlite:") {
-            // covers sqlite: and sqlite://
             EngineKind::Sqlite
         } else if dsn.contains("://") || dsn.contains(|c: char| c.is_whitespace()) {
-            // neither a known scheme nor a plausible file path
-            return Err(format!("unsupported or incomplete DSN: {dsn}"));
+            return Err(format!("unsupported or incomplete DSN: {}", redact(dsn)));
         } else {
-            // bare path: an existing sqlite file, never a new one
             EngineKind::Sqlite
         };
         if kind != EngineKind::Sqlite && host_of(dsn).is_empty() {
-            return Err(format!("incomplete DSN, no host: {dsn}"));
+            return Err(format!("incomplete DSN, no host: {}", redact(dsn)));
         }
         let mut path = None;
         let mut memory = false;
@@ -119,9 +124,7 @@ impl Conn {
         Ok(Conn { kind, url, path, memory, create, db_name })
     }
 
-    /// Load saved connections (< 5) from `~/.config/ru-sqlmux/connections.toml`.
-    /// Missing file is not an error; startup without a DSN falls back to the
-    /// connection named "default".
+    /// Loads profiles from `connections.toml`; a missing file is not an error.
     pub fn load_all() -> Result<Vec<ConnDef>, String> {
         let cfg = config_dir().join("connections.toml");
         let Ok(text) = fs::read_to_string(&cfg) else {
@@ -132,7 +135,12 @@ impl Conn {
         Ok(parsed
             .connection
             .into_values()
-            .map(|v| ConnDef { dsn: v.dsn, default: v.default })
+            .map(|v| ConnDef {
+                dsn: v.dsn,
+                default: v.default,
+                readonly: v.readonly,
+                query_timeout: v.query_timeout,
+            })
             .collect())
     }
 }
@@ -143,7 +151,6 @@ pub fn config_dir() -> PathBuf {
     {
         return PathBuf::from(home).join(".config").join("ru-sqlmux");
     }
-    // Windows: %APPDATA%
     if let Ok(appdata) = std::env::var("APPDATA")
         && !appdata.is_empty()
     {
@@ -152,17 +159,13 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(".config").join("ru-sqlmux")
 }
 
-/// Host portion of a server DSN (`postgres://u:p@host:5432/db` → `host:5432`).
 fn host_of(dsn: &str) -> &str {
     let rest = dsn.split_once("://").map(|(_, r)| r).unwrap_or("");
     let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
     host.split(['/', '?', '#']).next().unwrap_or("")
 }
 
-/// Database name from a server DSN's path segment (`postgres://h:5432/app` → `app`).
-/// Postgres defaults to a database named after the user when this is absent,
-/// so showing it surfaces that trap early. The userinfo is stripped from the
-/// right, because a password may contain a slash.
+/// Database name from the DSN path; the userinfo is stripped from the right because a password may contain a slash.
 fn dsn_name(dsn: &str) -> Option<String> {
     let rest = dsn.split_once("://").map(|(_, r)| r).unwrap_or(dsn);
     let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
@@ -174,31 +177,65 @@ fn dsn_name(dsn: &str) -> Option<String> {
     }
 }
 
-/// Replace every `env:NAME` with process env NAME; empty result is an error.
 fn expand_env(dsn: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = dsn;
     while let Some(at) = rest.find("env:") {
-        // marker name runs up to whitespace, quote or semicolon
         let after = &rest[at + 4..];
-        let name_end = after
+        let name_len = after
             .find(|c: char| c.is_whitespace() || c == '"' || c == ';' || c == '@' || c == '/')
-            .map(|k| k + 4)
-            .unwrap_or(rest.len());
-        let name = &rest[at + 4..at + name_end];
+            .unwrap_or(after.len());
+        let name = &after[..name_len];
         let val = std::env::var(name)
             .map_err(|_| format!("env var {name} not set (dsn uses env:{name})"))?;
         out.push_str(&rest[..at]);
         out.push_str(&val);
-        rest = &rest[at + name_end..];
+        rest = &after[name_len..];
     }
     out.push_str(rest);
     Ok(out)
 }
 
+/// DSN with the userinfo replaced, for messages that end up on screen.
+fn redact(dsn: &str) -> String {
+    let Some((scheme, rest)) = dsn.split_once("://") else {
+        return dsn.to_string();
+    };
+    match rest.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}"),
+        None => dsn.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_flags_default_off() {
+        let parsed: Connections = toml::from_str(
+            r#"
+            [connection.ro]
+            dsn = "sqlite://a.db"
+            readonly = true
+            query_timeout = 90
+
+            [connection.fast]
+            dsn = "sqlite://b.db"
+            "#,
+        )
+        .unwrap();
+        let ro = &parsed.connection["ro"];
+        assert!(ro.is_readonly());
+        assert_eq!(ro.timeout().as_secs(), 90);
+        let fast = &parsed.connection["fast"];
+        assert!(!fast.is_readonly());
+        assert_eq!(fast.timeout().as_secs(), 30);
+
+        // zero would time out every statement at once
+        let zero: Connections = toml::from_str("[connection.z]\ndsn='x'\nquery_timeout=0\n").unwrap();
+        assert_eq!(zero.connection["z"].timeout().as_secs(), 1);
+    }
 
     #[test]
     fn kinds() {
@@ -207,11 +244,9 @@ mod tests {
         assert_eq!(Conn::from_dsn("sqlite://app.db").unwrap().kind, EngineKind::Sqlite);
         assert_eq!(Conn::from_dsn("sqlite://app.db").unwrap().url, "sqlite:app.db");
         assert_eq!(Conn::from_dsn("sqlite::memory:").unwrap().url, "sqlite::memory:");
-        // an explicit sqlite scheme may create the file
         assert!(Conn::from_dsn("sqlite://brand-new.db").unwrap().create);
     }
 
-    /// Write a valid SQLite header, enough for the bare-path check.
     fn write_sqlite_header(path: &Path) {
         use std::io::Write;
         let mut f = std::fs::File::create(path).unwrap();
@@ -250,7 +285,6 @@ mod tests {
         let err = Conn::from_dsn(&text.to_string_lossy()).expect_err("text file refused");
         assert!(err.contains("is not a SQLite database"), "{err}");
 
-        // the explicit scheme is still allowed to create a new file
         assert!(Conn::from_dsn(&format!("sqlite://{}", empty.to_string_lossy())).is_ok());
 
         let _ = std::fs::remove_file(&empty);
@@ -266,7 +300,7 @@ mod tests {
             "postgres://user@",
             "postgresql:///db",
             "mysql://",
-            "postgrs://localhost/db", // typo: no known scheme, but a URL shape
+            "postgrs://localhost/db", // typo: URL shape, unknown scheme
             "not a dsn at all",
         ] {
             assert!(Conn::from_dsn(bad).is_err(), "should reject {bad:?}");
@@ -312,5 +346,20 @@ mod tests {
         let c = Conn::from_dsn("mysql://u:env:RUSQLMUX_TEST_PW@h/db").unwrap();
         assert_eq!(c.url, "mysql://u:s3cret@h/db");
         assert!(Conn::from_dsn("mysql://u:env:NOPE_XYZ_42@h/db").is_err());
+    }
+
+    #[test]
+    fn env_marker_at_the_end_of_the_dsn() {
+        // no @, / or whitespace after the marker: the old slice ran past the end
+        unsafe { std::env::set_var("RUSQLMUX_TAIL_PW", "pw") };
+        let c = Conn::from_dsn("postgres://u@h/db?password=env:RUSQLMUX_TAIL_PW").unwrap();
+        assert!(c.url.ends_with("password=pw"), "{}", c.url);
+    }
+
+    #[test]
+    fn a_bad_dsn_does_not_echo_the_password() {
+        let err = Conn::from_dsn("mysql://me:s3cret@/db").unwrap_err();
+        assert!(!err.contains("s3cret"), "{err}");
+        assert!(err.contains("***@"), "{err}");
     }
 }

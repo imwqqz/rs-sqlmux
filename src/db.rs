@@ -1,7 +1,4 @@
-/// sqlx 0.9 marks dynamic SQL as an audit boundary (SqlSafeStr). Every string
-/// built here goes through quote_ident/quote_literal (tool-crafted
-/// identifiers and literals, which is the sanitization); run_sql deliberately
-/// passes the user's own SQL text through. The one audit is this comment.
+/// Dynamic SQL is an audit boundary: every string here is built with quoted identifiers or literals, and `run_sql` passes the user's SQL on purpose.
 macro_rules! qs {
     ($sql:expr) => {
         sqlx::query(sqlx::AssertSqlSafe(($sql).to_string()))
@@ -13,34 +10,15 @@ macro_rules! qs_scalar {
     };
 }
 
-/// Read one row's snapshot for the optimistic check: (is_null, text).
-macro_rules! check_row {
-    ($tx:expr, $check:expr) => {{
-        let row = qs!(&$check)
-            .fetch_optional(&mut **$tx)
-            .await
-            .map_err(|err| format!("save check: {err}"))?;
-        match row {
-            None => None,
-            Some(r) => Some((
-                r.try_get::<Option<String>, _>(0).ok().flatten().unwrap_or_default() == "1",
-                r.try_get::<Option<String>, _>(1).ok().flatten(),
-            )),
-        }
-    }};
-}
-
 use crate::config::EngineKind;
 use crate::edit::{quote_ident, quote_literal, Edit, Report};
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{Column, Row};
+use sqlx::{Column, Executor, Row, SqlSafeStr, Statement};
 use std::str::FromStr;
 
 #[derive(Clone)]
 pub struct Col {
     pub name: String,
-    #[allow(dead_code)]
-    pub data_type: String,
     pub pk: bool,
 }
 
@@ -51,7 +29,7 @@ pub struct Page {
 pub struct RunResult {
     pub cols: Vec<String>,
     pub rows: Vec<Vec<String>>,
-    /// Set for DDL/DML statements ("OK (n rows affected)"), otherwise rows carry the data.
+    /// Set for DDL/DML; row queries fill `rows` instead.
     pub ok: Option<String>,
 }
 
@@ -95,8 +73,7 @@ fn ident(k: EngineKind, s: &str) -> String {
     quote_ident(k, s)
 }
 
-/// Table reference at query time: Postgres always reads the `public` schema,
-/// the same one the catalogue lists, regardless of the session's `search_path`.
+/// Postgres always reads `public`, regardless of `search_path`.
 fn qtable(k: EngineKind, table: &str) -> String {
     match k {
         EngineKind::Postgres => format!("public.{}", ident(k, table)),
@@ -104,7 +81,6 @@ fn qtable(k: EngineKind, table: &str) -> String {
     }
 }
 
-/// CAST target for text-ish cells: MySQL spells it CHAR, the others TEXT.
 fn cast_text(k: EngineKind) -> &'static str {
     match k {
         EngineKind::MySql => "CHAR",
@@ -112,7 +88,6 @@ fn cast_text(k: EngineKind) -> &'static str {
     }
 }
 
-/// SELECT for one page, every column cast to text by the server.
 fn page_sql(k: EngineKind, table: &str, cols: &[Col], order: Option<&(String, bool)>) -> String {
     let sel = cols
         .iter()
@@ -138,7 +113,6 @@ fn page_sql(k: EngineKind, table: &str, cols: &[Col], order: Option<&(String, bo
     sql
 }
 
-/// Run a cast-text query and collect every cell as a string.
 async fn fetch_cast_text(
     engine: &Engine,
     sql: &str,
@@ -158,7 +132,6 @@ async fn fetch_cast_text(
     })
 }
 
-/// Postgres row estimate from the catalogue, None when it is unusable.
 async fn pg_row_estimate(p: &sqlx::PgPool, table: &str) -> Result<Option<usize>, String> {
     let est: Option<i64> = qs_scalar!(
         "SELECT reltuples::BIGINT FROM pg_class c \
@@ -169,10 +142,10 @@ async fn pg_row_estimate(p: &sqlx::PgPool, table: &str) -> Result<Option<usize>,
     .fetch_optional(p)
     .await
     .map_err(e)?;
-    Ok(est.filter(|n| *n >= 0).map(|n| n as usize))
+    // 0 means "not analyzed yet" as often as "empty", so it cannot drive paging
+    Ok(est.filter(|n| *n > 0).map(|n| n as usize))
 }
 
-/// MySQL row estimate from information_schema, None when it is unusable.
 async fn mysql_row_estimate(p: &sqlx::MySqlPool, table: &str) -> Result<Option<usize>, String> {
     let est: Option<Option<i64>> = qs_scalar!(
         "SELECT TABLE_ROWS FROM information_schema.TABLES \
@@ -182,10 +155,9 @@ async fn mysql_row_estimate(p: &sqlx::MySqlPool, table: &str) -> Result<Option<u
     .fetch_optional(p)
     .await
     .map_err(e)?;
-    Ok(est.flatten().filter(|n| *n >= 0).map(|n| n as usize))
+    Ok(est.flatten().filter(|n| *n > 0).map(|n| n as usize))
 }
 
-/// Statements whose first word returns rows (the rest run as one DML exec).
 fn is_row_query(kw: &str) -> bool {
     matches!(
         kw,
@@ -194,8 +166,7 @@ fn is_row_query(kw: &str) -> bool {
     )
 }
 
-/// Transaction control words the console refuses, because a transaction left
-/// open on a pooled connection breaks every query that follows.
+/// A manual BEGIN would strand the pooled connection mid-transaction.
 fn is_tx_keyword(kw: &str) -> bool {
     matches!(
         kw,
@@ -203,7 +174,18 @@ fn is_tx_keyword(kw: &str) -> bool {
     )
 }
 
-/// Run a DDL/DML statement, returning rows affected.
+fn first_keyword(sql: &str, escapes: bool) -> String {
+    code_words(sql, escapes)
+        .first()
+        .map(|w| w.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// A read-only connection takes row queries only; shortcut: a `WITH ... DELETE` or a mutating `SELECT` still passes.
+pub fn is_read_sql(sql: &str, escapes: bool) -> bool {
+    is_row_query(&first_keyword(sql, escapes))
+}
+
 async fn exec_statement(engine: &Engine, sql: &str) -> Result<u64, String> {
     Ok(match engine {
         Engine::Postgres(p) => qs!(sql).execute(p).await.map_err(e)?.rows_affected(),
@@ -212,7 +194,6 @@ async fn exec_statement(engine: &Engine, sql: &str) -> Result<u64, String> {
     })
 }
 
-/// Run a row-returning statement per engine.
 async fn query_rows(engine: &Engine, sql: &str, kw: &str) -> Result<RunResult, String> {
     match engine {
         Engine::Postgres(p) => pg_query_rows(p, sql, kw).await,
@@ -221,34 +202,28 @@ async fn query_rows(engine: &Engine, sql: &str, kw: &str) -> Result<RunResult, S
     }
 }
 
-/// Postgres result can carry any row type; instead of a giant type map, the
-/// user's query is re-selected with per-column ::text casts, so the server does
-/// the conversion and the client sees strings only.
+/// The query is re-selected with `::text` casts, so the server does the conversion.
 async fn pg_query_rows(p: &sqlx::PgPool, sql: &str, kw: &str) -> Result<RunResult, String> {
     if !matches!(kw, "select" | "with" | "table" | "values") {
         // EXPLAIN / SHOW: single text column, decode as-is
         let rs = qs!(sql).fetch_all(p).await.map_err(e)?;
         return Ok(RunResult { cols: cols_pg(&rs), rows: decode_pg(&rs), ok: None });
     }
-    let names = pg_probe_names(p, sql).await?;
+    let names = pg_column_names(p, sql).await?;
     let cast_sql = pg_cast_sql(&names, sql);
     let rs = qs!(&cast_sql).fetch_all(p).await.map_err(e)?;
     Ok(RunResult { cols: cols_pg(&rs), rows: cast_pg(&rs), ok: None })
 }
 
-/// Column names of the user's query, from a zero-row probe.
-async fn pg_probe_names(p: &sqlx::PgPool, sql: &str) -> Result<Vec<String>, String> {
-    let probe = qs!(format!("SELECT * FROM ({sql}) AS probe LIMIT 0"))
-        .fetch_all(p)
+/// Preparing does not execute, so a data-modifying CTE runs once.
+async fn pg_column_names(p: &sqlx::PgPool, sql: &str) -> Result<Vec<String>, String> {
+    let stmt = p
+        .prepare(sqlx::AssertSqlSafe(sql).into_sql_str())
         .await
         .map_err(e)?;
-    Ok(probe
-        .first()
-        .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-        .unwrap_or_default())
+    Ok(stmt.columns().iter().map(|c| c.name().to_string()).collect())
 }
 
-/// The cast-everything select built around the user's query text.
 fn pg_cast_sql(names: &[String], sql: &str) -> String {
     if names.is_empty() {
         return format!(
@@ -275,8 +250,15 @@ async fn mysql_query_rows(p: &sqlx::MySqlPool, sql: &str, kw: &str) -> Result<Ru
     } else {
         sql.to_string()
     };
+    let cols = mysql_column_names(p, &capped).await?;
     let rs = qs!(&capped).fetch_all(p).await.map_err(e)?;
-    Ok(RunResult { cols: cols_my(&rs), rows: decode_my(&rs), ok: None })
+    Ok(RunResult { cols, rows: decode_my(&rs), ok: None })
+}
+
+/// Statement metadata keeps the headers when the result is empty.
+async fn mysql_column_names(p: &sqlx::MySqlPool, sql: &str) -> Result<Vec<String>, String> {
+    let stmt = p.prepare(sqlx::AssertSqlSafe(sql).into_sql_str()).await.map_err(e)?;
+    Ok(stmt.columns().iter().map(|c| c.name().to_string()).collect())
 }
 
 async fn sqlite_query_rows(p: &sqlx::SqlitePool, sql: &str, kw: &str) -> Result<RunResult, String> {
@@ -285,8 +267,14 @@ async fn sqlite_query_rows(p: &sqlx::SqlitePool, sql: &str, kw: &str) -> Result<
     } else {
         sql.to_string()
     };
+    let cols = sqlite_column_names(p, &capped).await?;
     let rs = qs!(&capped).fetch_all(p).await.map_err(e)?;
-    Ok(RunResult { cols: cols_li(&rs), rows: decode_li(&rs), ok: None })
+    Ok(RunResult { cols, rows: decode_li(&rs), ok: None })
+}
+
+async fn sqlite_column_names(p: &sqlx::SqlitePool, sql: &str) -> Result<Vec<String>, String> {
+    let stmt = p.prepare(sqlx::AssertSqlSafe(sql).into_sql_str()).await.map_err(e)?;
+    Ok(stmt.columns().iter().map(|c| c.name().to_string()).collect())
 }
 
 const CONSOLE_ROW_CAP: usize = 500;
@@ -296,12 +284,10 @@ fn cap_select(sql: &str) -> String {
     format!("SELECT * FROM ({sql}) AS capped LIMIT {CONSOLE_ROW_CAP}")
 }
 
-/// Cell text for a NULL is the empty string grid-wide.
 fn cell(row: Option<String>) -> String {
     row.unwrap_or_default()
 }
 
-/// Scanner state for `statement_count`.
 #[derive(Clone, Copy, PartialEq)]
 enum Scan {
     Code,
@@ -311,8 +297,7 @@ enum Scan {
     BlockComment,
 }
 
-// top-level statement count: the console runs one, so >1 is refused.
-// escapes is MySQL only, where \' does not close a string.
+// Counts top-level statements; `escapes` is MySQL, where \' does not close a string.
 fn statement_count(sql: &str, escapes: bool) -> usize {
     let mut n = 1;
     let mut st = Scan::Code;
@@ -320,10 +305,10 @@ fn statement_count(sql: &str, escapes: bool) -> usize {
     while let Some(c) = chars.next() {
         st = comment_step(st, c, &mut chars);
         if matches!(st, Scan::LineComment | Scan::BlockComment) {
-            continue; // a semicolon in here does not count
+            continue;
         }
         if escapes && in_string(st) && c == '\\' {
-            chars.next(); // the escaped character cannot close the string
+            chars.next();
             continue;
         }
         st = code_step(st, c, &mut n);
@@ -335,7 +320,6 @@ fn in_string(st: Scan) -> bool {
     matches!(st, Scan::Single | Scan::Double)
 }
 
-// comments own the lookahead: /* */ and -- are the only two-character tokens
 fn comment_step(st: Scan, c: char, chars: &mut std::iter::Peekable<std::str::Chars>) -> Scan {
     match (st, c) {
         (Scan::Code, '/') if chars.peek() == Some(&'*') => {
@@ -355,7 +339,6 @@ fn comment_step(st: Scan, c: char, chars: &mut std::iter::Peekable<std::str::Cha
     }
 }
 
-// quotes open and close a string; a top-level ; ends a statement
 fn code_step(st: Scan, c: char, n: &mut usize) -> Scan {
     match (st, c) {
         (Scan::Code, '\'') => Scan::Single,
@@ -369,11 +352,52 @@ fn code_step(st: Scan, c: char, n: &mut usize) -> Scan {
     }
 }
 
-/// Connection budget shared by the three pool builders.
+/// Words outside comments and strings, so a keyword in a literal is not read.
+fn code_words(sql: &str, escapes: bool) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut st = Scan::Code;
+    let mut semicolons = 0;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        st = comment_step(st, c, &mut chars);
+        if matches!(st, Scan::LineComment | Scan::BlockComment) {
+            flush_word(&mut words, &mut cur);
+            continue;
+        }
+        if escapes && in_string(st) && c == '\\' {
+            chars.next();
+            continue;
+        }
+        let in_code = st == Scan::Code;
+        st = code_step(st, c, &mut semicolons);
+        if in_code && (c.is_alphanumeric() || c == '_') {
+            cur.push(c);
+        } else {
+            flush_word(&mut words, &mut cur);
+        }
+    }
+    flush_word(&mut words, &mut cur);
+    words
+}
+
+fn flush_word(words: &mut Vec<String>, cur: &mut String) {
+    if !cur.is_empty() {
+        words.push(std::mem::take(cur));
+    }
+}
+
+/// UPDATE/DELETE with no WHERE; shortcut: a `WITH ... DELETE` or a WHERE in a subquery is missed.
+pub fn destructive_without_where(sql: &str, escapes: bool) -> bool {
+    let words = code_words(sql, escapes);
+    let Some(first) = words.first() else { return false };
+    let dml = first.eq_ignore_ascii_case("update") || first.eq_ignore_ascii_case("delete");
+    dml && !words.iter().any(|w| w.eq_ignore_ascii_case("where"))
+}
+
 const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
-// one job's wall clock: dropping the future returns the pooled connection,
-// but the server may still finish the statement
+// One job's wall clock; the server may still finish a timed-out statement.
 pub const QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn pg_pool(url: &str) -> Result<sqlx::PgPool, String> {
@@ -395,29 +419,24 @@ async fn mysql_pool(url: &str) -> Result<sqlx::MySqlPool, String> {
 }
 
 async fn sqlite_pool(conn: &crate::config::Conn) -> Result<sqlx::SqlitePool, String> {
-    // path goes in as a path, never through URL parsing, so drive letters and
-    // backslashes stay intact
+    // Passed as a path, never through URL parsing, so Windows drive letters survive.
     let opts = if conn.memory {
         SqliteConnectOptions::from_str("sqlite::memory:").map_err(e)?
     } else {
         let path = conn.path.clone().unwrap_or_else(|| ":memory:".into());
-        // a bare path must already exist (the parser checked); only an explicit
-        // sqlite: scheme may create the file
+        // Only an explicit sqlite: scheme may create the file.
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(conn.create)
     };
-    // one connection for :memory:, because a pool of five would open five
-    // separate empty databases
+    // One connection for :memory:; a pool of five would open five empty databases.
     let max = if conn.memory { 1 } else { 5 };
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(max)
         .connect_with(opts)
         .await
         .map_err(e)?;
-    // A newly created file stays 0 bytes until something is written, and a 0
-    // byte file would be refused by the bare-path check on the next run. Writing
-    // the header here keeps the file a real database from the start.
+    // A 0-byte file would be refused on the next bare open, so write the header.
     if conn.create
         && !conn.memory
         && conn
@@ -431,9 +450,7 @@ async fn sqlite_pool(conn: &crate::config::Conn) -> Result<sqlx::SqlitePool, Str
 }
 
 impl Engine {
-    /// Connect with a hard wall-clock budget: a slow or unreachable server must
-    /// not leave the UI hanging. It fails after `budget` and the caller shows
-    /// the error on the form.
+    /// Fails after the budget so a slow server cannot hang the UI.
     pub async fn connect(conn: &crate::config::Conn) -> Result<Engine, String> {
         let budget = CONNECT_BUDGET;
         let r = match tokio::time::timeout(budget, Engine::connect_inner(conn)).await {
@@ -457,8 +474,7 @@ impl Engine {
         })
     }
 
-    /// The database actually being read. Postgres defaults to a database named
-    /// after the connecting user, so showing this catches wrong-DSN mistakes.
+    /// Postgres falls back to a database named after the user, so show what opened.
     pub async fn db_label(&self) -> String {
         match self {
             Engine::Postgres(p) => {
@@ -479,7 +495,6 @@ impl Engine {
         }
     }
 
-    /// Names of browsable tables in the default schema/DB.
     pub async fn tables(&self) -> Result<Vec<String>, String> {
         let sql = match self {
             Engine::Postgres(_) => {
@@ -517,16 +532,13 @@ impl Engine {
         })
     }
 
-    /// Columns of a table + single-column PK flag.
-    /// shortcut: only single-column PKs are editable and only the default
-    /// schema (`public` / DATABASE()) is browsed. upgrade = schema panel +
-    /// composite-PK row keys.
+    /// shortcut: only single-column PKs are editable and only the default schema is browsed.
     pub async fn columns(&self, table: &str) -> Result<Vec<Col>, String> {
         match self {
             Engine::Postgres(p) => {
                 let pk = pk_of_pg(p, table).await;
                 let rows = sqlx::query(
-                    "SELECT column_name, data_type FROM information_schema.columns \
+                    "SELECT column_name FROM information_schema.columns \
                      WHERE table_schema = 'public' AND table_name = $1 \
                      ORDER BY ordinal_position",
                 )
@@ -538,19 +550,15 @@ impl Engine {
                     .into_iter()
                     .map(|r| {
                         let name: Option<String> = r.try_get(0).ok().flatten();
-                        let data_type: Option<String> = r.try_get(1).ok().flatten();
-                        Col {
-                            name: name.clone().unwrap_or_default(),
-                            data_type: data_type.unwrap_or_default(),
-                            pk: name.is_some_and(|n| pk.contains(&n)),
-                        }
+                        let is_pk = name.as_ref().is_some_and(|n| pk.contains(n));
+                        Col { name: name.unwrap_or_default(), pk: is_pk }
                     })
                     .collect())
             }
             Engine::MySql(p) => {
                 let pk = pk_of_mysql(p, table).await;
                 let rows = sqlx::query(
-                    "SELECT column_name, data_type FROM information_schema.columns \
+                    "SELECT column_name FROM information_schema.columns \
                      WHERE table_schema = DATABASE() AND table_name = ? \
                      ORDER BY ordinal_position",
                 )
@@ -562,12 +570,8 @@ impl Engine {
                     .into_iter()
                     .map(|r| {
                         let name: Option<String> = r.try_get(0).ok().flatten();
-                        let data_type: Option<String> = r.try_get(1).ok().flatten();
-                        Col {
-                            name: name.clone().unwrap_or_default(),
-                            data_type: data_type.unwrap_or_default(),
-                            pk: name.is_some_and(|n| pk.contains(&n)),
-                        }
+                        let is_pk = name.as_ref().is_some_and(|n| pk.contains(n));
+                        Col { name: name.unwrap_or_default(), pk: is_pk }
                     })
                     .collect())
             }
@@ -578,7 +582,6 @@ impl Engine {
                     .into_iter()
                     .map(|r| Col {
                         name: r.try_get(1).ok().flatten().unwrap_or_default(),
-                        data_type: r.try_get(2).ok().flatten().unwrap_or_default(),
                         pk: r.get::<i64, _>(5) != 0,
                     })
                     .collect())
@@ -586,10 +589,7 @@ impl Engine {
         }
     }
 
-    /// One page of table data; every cell CAST to TEXT by the server so the
-    /// client never needs a type map for browsing.
-    /// shortcut: blobs come back as cast text (often garbage); upgrade = typed
-    /// decode in the grid too.
+    /// shortcut: blobs come back as cast text, often garbage.
     pub async fn fetch_page(
         &self,
         table: &str,
@@ -615,10 +615,7 @@ impl Engine {
         Ok(n.max(0) as usize)
     }
 
-    /// (rows, approximate?). Postgres/MySQL take the cheap catalogue statistic
-    /// so opening a huge table never freezes on a full COUNT(*); they fall back
-    /// to an exact count only when the statistic is missing (never analyzed,
-    /// view, unsupported). SQLite counts exactly, since it is a local file scan.
+    /// Catalogue estimate with an exact fallback; SQLite always counts exactly.
     pub async fn count_estimate(&self, table: &str) -> Result<(usize, bool), String> {
         let est = match self {
             Engine::Postgres(p) => pg_row_estimate(p, table).await?,
@@ -631,24 +628,21 @@ impl Engine {
         }
     }
 
-    /// Row-returning SQL from the console; DDL/DML returns "OK (n affected)".
-    /// shortcut: only the first statement of a multi-statement string runs;
-    /// edits and results are capped to 500 rows.
+    /// One statement only; results are capped at 500 rows.
     pub async fn run_sql(&self, sql_in: &str) -> Result<RunResult, String> {
         let sql = sql_in.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql);
         if sql.is_empty() {
             return Ok(RunResult { cols: vec![], rows: vec![], ok: Some(String::new()) });
         }
-        if statement_count(sql, self.kind() == EngineKind::MySql) > 1 {
+        let escapes = self.kind() == EngineKind::MySql;
+        if statement_count(sql, escapes) > 1 {
             return Err(
                 "one statement at a time: split on the semicolon and run each part".into(),
             );
         }
-        let kw = sql.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        // A manual BEGIN leaves a pooled connection mid-transaction that the
-        // next statement may or may not land on. Transactions are owned by the
-        // edit path (C-s), so the console refuses to start one.
+        let kw = first_keyword(sql, escapes);
+        // A manual BEGIN would strand the pooled connection mid-transaction.
         if is_tx_keyword(&kw) {
             return Err(
                 "the console runs one statement at a time; C-s applies your edits in a transaction"
@@ -666,11 +660,8 @@ impl Engine {
         query_rows(self, sql, &kw).await
     }
 
-    /// Apply pending edits + deletes + inserts in one transaction.
-    /// Optimistic: every update re-reads the original cell inside the tx and
-    /// aborts the whole batch if another client changed it meanwhile.
-    /// Delete is by PK only (shortcut: mid-transaction row mutations by others
-    /// are not detected for deletes; upgrade = full-row compare).
+    /// One transaction; each update carries the old cell in its WHERE, so a concurrent change aborts the batch.
+    /// shortcut: deletes are by PK and are not checked against a concurrent change.
     pub async fn save(
         &self,
         table: &str,
@@ -686,20 +677,15 @@ impl Engine {
         })
     }
 }
-// ---------- per-engine transactional save --------------------------------
-// sqlx transaction and row types differ per database, so each engine keeps its
-// own small steps. The SQL text itself comes from the pure builders above.
-
-/// WHERE clause for the row identity.
-fn pk_pred(pkc: &str, pk: &str) -> String {
+// sqlx types differ per engine, so each engine keeps its own steps; the SQL comes from the builders above.
+fn pk_pred(k: EngineKind, pkc: &str, pk: &str) -> String {
     if pk.is_empty() {
         format!("{pkc} IS NULL")
     } else {
-        format!("{pkc} = {}", quote_literal(pk))
+        format!("{pkc} = {}", quote_literal(k, pk))
     }
 }
 
-/// Message shown when the optimistic check finds a different value.
 fn conflict_msg(pk: &str, col: &str) -> String {
     format!(
         "conflict: row pk={} col={} changed by someone else. refresh (R) and retry",
@@ -708,54 +694,33 @@ fn conflict_msg(pk: &str, col: &str) -> String {
     )
 }
 
-/// Read NULL-ness and text together: the grid shows NULL as "", so an empty
-/// snapshot must match a NULL cell.
-fn check_sql(k: EngineKind, t: &str, col: &str, pkc: &str, pk: &str) -> String {
-    format!(
-        "SELECT CASE WHEN {c} IS NULL THEN '1' ELSE '0' END, CAST({c} AS {cas}) FROM {t} WHERE {pred}",
-        c = ident(k, col),
-        cas = cast_text(k),
-        pred = pk_pred(pkc, pk)
-    )
+/// The old value is in the WHERE, so check and write are atomic; an empty original accepts NULL or ''.
+fn update_sql(
+    k: EngineKind,
+    t: &str,
+    col: &str,
+    new: &str,
+    pkc: &str,
+    pk: &str,
+    orig: &str,
+) -> String {
+    let c = ident(k, col);
+    let v = if new == ":null" { "NULL".to_string() } else { quote_literal(k, new) };
+    let old = if orig.is_empty() {
+        format!("({c} IS NULL OR CAST({c} AS {}) = '')", cast_text(k))
+    } else {
+        format!("CAST({c} AS {}) = {}", cast_text(k), quote_literal(k, orig))
+    };
+    format!("UPDATE {t} SET {c} = {v} WHERE {} AND {old}", pk_pred(k, pkc, pk))
 }
 
-// :null emits a bare NULL; the grid shows NULL and '' the same way
-fn update_sql(k: EngineKind, t: &str, col: &str, new: &str, pkc: &str, pk: &str) -> String {
-    let v = if new == ":null" { "NULL".to_string() } else { quote_literal(new) };
-    format!(
-        "UPDATE {t} SET {c} = {v} WHERE {pred}",
-        c = ident(k, col),
-        pred = pk_pred(pkc, pk)
-    )
+fn delete_sql(k: EngineKind, t: &str, pkc: &str, pk: &str) -> String {
+    format!("DELETE FROM {t} WHERE {}", pk_pred(k, pkc, pk))
 }
 
-fn delete_sql(t: &str, pkc: &str, pk: &str) -> String {
-    format!("DELETE FROM {t} WHERE {}", pk_pred(pkc, pk))
-}
-
-/// A draft is an explicit primary key unless the user left it empty.
 fn draft_pk(draft: &Option<String>) -> Option<&str> {
     draft.as_deref().map(str::trim).filter(|d| !d.is_empty())
 }
-
-/// Shared optimistic check for one edit.
-fn check_edit(tx_row: Option<(bool, Option<String>)>, ed: &Edit) -> Result<(), String> {
-    let Some((is_null, text)) = tx_row else {
-        return Err(conflict_msg(&ed.pk, &ed.col));
-    };
-    let same = if is_null {
-        ed.orig.is_empty()
-    } else {
-        text.unwrap_or_default() == ed.orig
-    };
-    if same {
-        Ok(())
-    } else {
-        Err(conflict_msg(&ed.pk, &ed.col))
-    }
-}
-
-// --- Postgres ------------------------------------------------------------
 
 async fn pg_save(
     p: &sqlx::PgPool,
@@ -823,14 +788,13 @@ async fn pg_update(
     let k = EngineKind::Postgres;
     let t = qtable(k, table);
     let pkc = ident(k, pk_col);
-    let snapshot = check_row!(tx, check_sql(k, &t, &ed.col, &pkc, &ed.pk));
-    check_edit(snapshot, ed)?;
-    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk);
-    qs!(&sql)
+    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk, &ed.orig);
+    let n = qs!(&sql)
         .execute(&mut **tx)
         .await
-        .map_err(|err| format!("save update: {err}"))?;
-    Ok(())
+        .map_err(|err| format!("save update: {err}"))?
+        .rows_affected();
+    if n == 1 { Ok(()) } else { Err(conflict_msg(&ed.pk, &ed.col)) }
 }
 
 async fn pg_delete(
@@ -840,7 +804,7 @@ async fn pg_delete(
     pk: &str,
 ) -> Result<(), String> {
     let k = EngineKind::Postgres;
-    let sql = delete_sql(&qtable(k, table), &ident(k, pk_col), pk);
+    let sql = delete_sql(k, &qtable(k, table), &ident(k, pk_col), pk);
     qs!(&sql)
         .execute(&mut **tx)
         .await
@@ -861,7 +825,7 @@ async fn pg_insert(
     let ins = match draft_pk(draft) {
         Some(pk) => format!(
             "INSERT INTO {t} ({pkc}) VALUES ({}) RETURNING CAST({pkc} AS {cas})",
-            quote_literal(pk)
+            quote_literal(k, pk)
         ),
         None => format!("INSERT INTO {t} DEFAULT VALUES RETURNING CAST({pkc} AS {cas})"),
     };
@@ -872,8 +836,6 @@ async fn pg_insert(
         .ok_or("insert row produced no identity")?;
     Ok(cell(row.try_get(0).ok().flatten()))
 }
-
-// --- MySQL ---------------------------------------------------------------
 
 async fn mysql_save(
     p: &sqlx::MySqlPool,
@@ -941,14 +903,13 @@ async fn mysql_update(
     let k = EngineKind::MySql;
     let t = qtable(k, table);
     let pkc = ident(k, pk_col);
-    let snapshot = check_row!(tx, check_sql(k, &t, &ed.col, &pkc, &ed.pk));
-    check_edit(snapshot, ed)?;
-    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk);
-    qs!(&sql)
+    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk, &ed.orig);
+    let n = qs!(&sql)
         .execute(&mut **tx)
         .await
-        .map_err(|err| format!("save update: {err}"))?;
-    Ok(())
+        .map_err(|err| format!("save update: {err}"))?
+        .rows_affected();
+    if n == 1 { Ok(()) } else { Err(conflict_msg(&ed.pk, &ed.col)) }
 }
 
 async fn mysql_delete(
@@ -958,7 +919,7 @@ async fn mysql_delete(
     pk: &str,
 ) -> Result<(), String> {
     let k = EngineKind::MySql;
-    let sql = delete_sql(&qtable(k, table), &ident(k, pk_col), pk);
+    let sql = delete_sql(k, &qtable(k, table), &ident(k, pk_col), pk);
     qs!(&sql)
         .execute(&mut **tx)
         .await
@@ -978,7 +939,7 @@ async fn mysql_insert(
     // explicit pk: LAST_INSERT_ID() stays 0 here, so the draft IS the identity
     match draft_pk(draft) {
         Some(pk) => {
-            let ins = format!("INSERT INTO {t} ({pkc}) VALUES ({})", quote_literal(pk));
+            let ins = format!("INSERT INTO {t} ({pkc}) VALUES ({})", quote_literal(k, pk));
             qs!(&ins)
                 .execute(&mut **tx)
                 .await
@@ -998,8 +959,6 @@ async fn mysql_insert(
         }
     }
 }
-
-// --- SQLite --------------------------------------------------------------
 
 async fn sqlite_save(
     p: &sqlx::SqlitePool,
@@ -1067,14 +1026,13 @@ async fn sqlite_update(
     let k = EngineKind::Sqlite;
     let t = qtable(k, table);
     let pkc = ident(k, pk_col);
-    let snapshot = check_row!(tx, check_sql(k, &t, &ed.col, &pkc, &ed.pk));
-    check_edit(snapshot, ed)?;
-    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk);
-    qs!(&sql)
+    let sql = update_sql(k, &t, &ed.col, &ed.new, &pkc, &ed.pk, &ed.orig);
+    let n = qs!(&sql)
         .execute(&mut **tx)
         .await
-        .map_err(|err| format!("save update: {err}"))?;
-    Ok(())
+        .map_err(|err| format!("save update: {err}"))?
+        .rows_affected();
+    if n == 1 { Ok(()) } else { Err(conflict_msg(&ed.pk, &ed.col)) }
 }
 
 async fn sqlite_delete(
@@ -1084,7 +1042,7 @@ async fn sqlite_delete(
     pk: &str,
 ) -> Result<(), String> {
     let k = EngineKind::Sqlite;
-    let sql = delete_sql(&qtable(k, table), &ident(k, pk_col), pk);
+    let sql = delete_sql(k, &qtable(k, table), &ident(k, pk_col), pk);
     qs!(&sql)
         .execute(&mut **tx)
         .await
@@ -1102,7 +1060,7 @@ async fn sqlite_insert(
     let t = qtable(k, table);
     let pkc = ident(k, pk_col);
     let ins = match draft_pk(draft) {
-        Some(pk) => format!("INSERT INTO {t} ({pkc}) VALUES ({})", quote_literal(pk)),
+        Some(pk) => format!("INSERT INTO {t} ({pkc}) VALUES ({})", quote_literal(k, pk)),
         None => format!("INSERT INTO {t} DEFAULT VALUES"),
     };
     qs!(&ins)
@@ -1116,10 +1074,7 @@ async fn sqlite_insert(
     Ok(n.to_string())
 }
 
-// ---------- concrete per-row-type helpers (kept non-generic on purpose) -----
-// sqlx's Row/Column traits are per-database; every helper below exists three
-// times. Copy is cheaper than the trait machinery it would take to dedupe.
-
+// sqlx's row traits are per-database, so each helper exists three times; copying is cheaper than deduping.
 use sqlx::postgres::PgRow;
 use sqlx::mysql::MySqlRow;
 use sqlx::sqlite::SqliteRow;
@@ -1130,19 +1085,6 @@ fn cols_pg(rs: &[PgRow]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn cols_my(rs: &[MySqlRow]) -> Vec<String> {
-    rs.first()
-        .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-        .unwrap_or_default()
-}
-
-fn cols_li(rs: &[SqliteRow]) -> Vec<String> {
-    rs.first()
-        .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-        .unwrap_or_default()
-}
-
-/// every cell of a set that was built with per-column CAST(... AS TEXT/CHAR)
 fn cast_pg(rs: &[PgRow]) -> Vec<Vec<String>> {
     rs.iter()
         .map(|r| {
@@ -1173,10 +1115,7 @@ fn cast_li(rs: &[SqliteRow]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Decode arbitrary rows by trying types in order until one lands.
-/// String first: text/date/decimal read as the server sent them; numbers
-/// fall through. shortcut: unsigned bigint beyond i64 shows in float
-/// scientific form; upgrade = per-engine type match.
+/// Tries String, i64, f64, then bytes; shortcut: a u64 beyond i64 shows in float form.
 fn decode_pg(rs: &[PgRow]) -> Vec<Vec<String>> {
     rs.iter()
         .map(|r| {
@@ -1245,7 +1184,10 @@ async fn pk_of_pg(p: &sqlx::PgPool, table: &str) -> Vec<String> {
     sqlx::query(
         "SELECT kcu.column_name FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
-         ON tc.constraint_name = kcu.constraint_name \
+         ON tc.constraint_schema = kcu.constraint_schema \
+         AND tc.constraint_name = kcu.constraint_name \
+         AND tc.table_schema = kcu.table_schema \
+         AND tc.table_name = kcu.table_name \
          WHERE tc.constraint_type = 'PRIMARY KEY' \
          AND tc.table_schema = 'public' AND tc.table_name = $1",
     )
@@ -1262,7 +1204,10 @@ async fn pk_of_mysql(p: &sqlx::MySqlPool, table: &str) -> Vec<String> {
     sqlx::query(
         "SELECT kcu.column_name FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
-         ON tc.constraint_name = kcu.constraint_name \
+         ON tc.constraint_schema = kcu.constraint_schema \
+         AND tc.constraint_name = kcu.constraint_name \
+         AND tc.table_schema = kcu.table_schema \
+         AND tc.table_name = kcu.table_name \
          WHERE tc.constraint_type = 'PRIMARY KEY' \
          AND tc.table_schema = DATABASE() AND tc.table_name = ?",
     )
@@ -1281,8 +1226,7 @@ mod tests {
     use crate::edit::Edit;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    /// Run a fixture script: the console refuses multi-statement text on
-    /// purpose, so tests split it themselves.
+    // The console refuses multi-statement text, so tests split their scripts.
     async fn script(e: &Engine, sql: &str) {
         for stmt in sql.split(';') {
             if !stmt.trim().is_empty() {
@@ -1291,7 +1235,7 @@ mod tests {
         }
     }
 
-    /// single connection so the in-memory DB is shared across statements
+    /// One connection, so the in-memory database is shared across statements.
     async fn mem() -> Engine {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
@@ -1317,12 +1261,10 @@ mod tests {
 
         let page = e.fetch_page("t", &cols, Some(("id".into(), false)), 100, 0).await.unwrap();
         assert_eq!(page.rows.len(), 2);
-        // cast-to-text pages: every cell is a string
         assert_eq!(page.rows[0][1], "a");
         assert_eq!(page.rows[0][2], "1.5");
         assert_eq!(e.count("t").await.unwrap(), 2);
 
-        // update one cell inside a transaction, optimistic check passes
         let rep = e
             .save(
                 "t",
@@ -1352,7 +1294,6 @@ mod tests {
         let page = e.fetch_page("t", &cols, None, 100, 0).await.unwrap();
         assert_eq!(page.rows[0][1], "a2", "conflicted row must be untouched");
 
-        // delete + insert (draft pk typed / default pk)
         let rep = e.save("t", "id", &[], &["2".into()], &[Some("42".into()), None]).await.unwrap();
         assert_eq!(rep.deletes, 1);
         // sqlite rowid after an explicit 42 is 43 (max+1)
@@ -1367,8 +1308,7 @@ mod tests {
         let e = mem().await;
         e.run_sql("INSERT INTO t (id, name, score) VALUES (9, NULL, NULL)").await.unwrap();
 
-        // the grid shows NULL as "", so an empty snapshot must not read as
-        // "someone else changed it"
+        // The grid shows NULL as "", so an empty snapshot must match a NULL cell.
         let rep = e
             .save(
                 "t",
@@ -1418,8 +1358,8 @@ mod tests {
     #[test]
     fn page_sql_dialects() {
         let cols = vec![
-            Col { name: "id".into(), data_type: "int".into(), pk: true },
-            Col { name: "na\"me".into(), data_type: "text".into(), pk: false },
+            Col { name: "id".into(), pk: true },
+            Col { name: "na\"me".into(), pk: false },
         ];
         let pg = page_sql(EngineKind::Postgres, "t", &cols, Some(&("id".into(), true)));
         assert_eq!(
@@ -1461,6 +1401,43 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_table_mutation_is_detected() {
+        for sql in [
+            "update t set a = 1",
+            "DELETE FROM t",
+            // a keyword in a literal or a comment is not a WHERE
+            "update t set note = 'where x'",
+            "-- delete from t where id=1\nupdate t set a=1",
+        ] {
+            assert!(destructive_without_where(sql, false), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_where_clause_or_a_plain_select_is_not_flagged() {
+        for sql in [
+            "UPDATE t SET a = 1 WHERE id = 1",
+            "delete from t where id = 2",
+            "select 'update t set a = 1'",
+            // an identifier that starts with a keyword is not that keyword
+            "delete_note from t",
+        ] {
+            assert!(!destructive_without_where(sql, false), "{sql}");
+        }
+    }
+
+    #[test]
+    fn readonly_sql_is_only_the_row_queries() {
+        assert!(is_read_sql("select 1", false));
+        assert!(is_read_sql("  WITH x AS (SELECT 1) SELECT * FROM x", false));
+        assert!(is_read_sql("PRAGMA table_info(t)", false));
+        // a leading comment must not hide the keyword
+        assert!(is_read_sql("-- note\nSELECT 1", false));
+        assert!(!is_read_sql("update t set a = 1", false));
+        assert!(!is_read_sql("drop table t", false));
+    }
+
+    #[test]
     fn a_select_cap_wraps_and_keeps_a_user_limit() {
         let capped = cap_select("SELECT id FROM t LIMIT 1");
         assert!(capped.contains("(SELECT id FROM t LIMIT 1) AS capped"), "{capped}");
@@ -1469,11 +1446,20 @@ mod tests {
 
     #[test]
     fn a_null_token_writes_a_bare_null() {
-        let sql = update_sql(EngineKind::Sqlite, "t", "c", ":null", "id", "1");
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", ":null", "id", "1", "old");
         assert!(sql.contains("= NULL"), "{sql}");
         assert!(!sql.contains("':null'"), "{sql}");
-        let sql = update_sql(EngineKind::Sqlite, "t", "c", "x", "id", "1");
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", "x", "id", "1", "old");
         assert!(sql.contains("= 'x'"), "{sql}");
+    }
+
+    #[test]
+    fn the_old_value_is_part_of_the_update() {
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", "new", "id", "1", "old");
+        assert!(sql.contains("WHERE id = '1' AND CAST(\"c\" AS TEXT) = 'old'"), "{sql}");
+        // NULL and '' both read as an empty cell, so an empty original accepts either
+        let sql = update_sql(EngineKind::Sqlite, "t", "c", "new", "id", "1", "");
+        assert!(sql.contains("(\"c\" IS NULL OR CAST(\"c\" AS TEXT) = '')"), "{sql}");
     }
 
     #[tokio::test]
@@ -1488,14 +1474,11 @@ mod tests {
     #[tokio::test]
     async fn multiple_statements_are_refused_with_a_clear_message() {
         let e = mem().await;
-        // the Postgres path wraps row-returning SQL in a subquery, so a second
-        // statement would surface as a baffling syntax error; refuse first
+        // The Postgres path wraps the query, so a second statement would be a syntax error.
         let err = e.run_sql("SELECT 1; SELECT 2").await.unwrap_err();
         assert!(err.contains("one statement"), "{err}");
-        // a semicolon inside a string literal is not a second statement
         let r = e.run_sql("SELECT ';' AS x").await.unwrap();
         assert_eq!(r.rows[0][0], ";");
-        // and a lone trailing semicolon is fine
         assert_eq!(e.run_sql("SELECT 1;").await.unwrap().rows[0][0], "1");
     }
 
@@ -1504,21 +1487,18 @@ mod tests {
         let e = mem().await;
         let err = e.run_sql("BEGIN").await.unwrap_err();
         assert!(err.contains("one statement at a time"), "{err}");
-        // normal statements still work afterwards
         assert_eq!(e.count("t").await.unwrap(), 2);
     }
 
     #[tokio::test]
     async fn sqlite_file_path_roundtrip() {
-        // P2 regression: a real file path (Windows drive letters included) must
-        // open through Conn → Engine::connect, not through URL parsing.
+        // A real path must open through Engine::connect, not URL parsing.
         let dir = std::env::temp_dir();
         let file = dir.join(format!("ru-sqlmux-test-{}.db", std::process::id()));
         let dsn = file.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&file);
         assert!(crate::config::Conn::from_dsn(&dsn).is_err(), "missing file is refused");
 
-        // create a real database through the explicit scheme, then open it bare
         let made = crate::config::Conn::from_dsn(&format!("sqlite://{dsn}")).unwrap();
         let creator = Engine::connect(&made).await.unwrap();
         script(
@@ -1541,8 +1521,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_scheme_creates_a_real_file() {
-        // A file our own app creates must have a real header, otherwise the
-        // next bare-path open would refuse the file the app just made.
+        // A 0-byte file would be refused on the next bare open, so keep a real header.
         let dir = std::env::temp_dir();
         let file = dir.join(format!("ru-sqlmux-new-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -1557,7 +1536,6 @@ mod tests {
         let len = std::fs::metadata(&file).unwrap().len();
         assert!(len >= 16, "created database should carry the sqlite header, got {len} bytes");
 
-        // and it opens again through a bare path
         let bare = crate::config::Conn::from_dsn(&dsn).unwrap();
         assert!(!bare.create);
         let reopened = Engine::connect(&bare).await.unwrap();
@@ -1571,20 +1549,34 @@ mod tests {
     async fn console_sql_paths() {
         let e = mem().await;
 
-        // row-returning: typed decode by value, not by cast
+        // A row query decodes by value, not by cast.
         let r = e.run_sql("SELECT id, name FROM t ORDER BY id").await.unwrap();
         assert_eq!(r.cols, vec!["id", "name"]);
         assert_eq!(r.rows[0], vec!["1".to_string(), "a".to_string()]);
         assert!(r.ok.is_none());
 
-        // DML reports affected rows; trailing semicolon is tolerated
         let r = e.run_sql("UPDATE t SET name = 'x' WHERE id = 1;").await.unwrap();
         assert_eq!(r.ok.as_deref(), Some("OK (1 rows affected)"));
         let r = e.run_sql("DELETE FROM t").await.unwrap();
         assert_eq!(r.ok.as_deref(), Some("OK (2 rows affected)"));
         assert_eq!(e.count("t").await.unwrap(), 0);
 
-        // empty input is a no-op, not an error
         assert_eq!(e.run_sql("  ").await.unwrap().ok.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn an_empty_select_still_has_headers() {
+        let e = mem().await;
+        let r = e.run_sql("SELECT id, name FROM t WHERE 1 = 0").await.unwrap();
+        assert_eq!(r.cols, vec!["id", "name"]);
+        assert!(r.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_leading_comment_does_not_hide_a_select() {
+        let e = mem().await;
+        let r = e.run_sql("-- note\nSELECT id FROM t ORDER BY id").await.unwrap();
+        assert_eq!(r.cols, vec!["id"]);
+        assert_eq!(r.rows.len(), 2);
     }
 }

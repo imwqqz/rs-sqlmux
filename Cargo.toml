@@ -13,7 +13,6 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.1.8"
 tui-textarea = "0.7.0"
 
-# Complexity budget is enforced: clippy.toml sets the threshold to 7, and this
-# makes any function at 8 or more fail the build.
+# clippy.toml sets the threshold to 7, so 8 or more fails the build.
 [lints.clippy]
 cognitive_complexity = "deny"

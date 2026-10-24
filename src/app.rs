@@ -1,4 +1,4 @@
-use crate::config::Conn;
+use crate::config::{Conn, ConnDef, EngineKind};
 use crate::console::Console;
 use crate::db::{self, Engine};
 use crate::edit::Edit;
@@ -20,7 +20,7 @@ const HELP: &str = r#"
  Grid       h/l j/k move  g/G start/end  [ ] page  s sort column
             e edit cell  o insert row  d (un)delete row
             in the cell editor: :null writes NULL, an empty value writes ''
-            C-s save all as one transaction  R refresh
+            C-s save all as one transaction  R refresh  E export page
  SQL        Enter run  Alt-Enter newline  Alt-Up/Down history
  Results    j/k scroll  Enter back to grid
 "#;
@@ -39,7 +39,7 @@ pub struct TableData {
     pub name: String,
     pub cols: Vec<db::Col>,
     pub pk_idx: Option<usize>,
-    /// current page of cast-text rows
+    /// Current page; every cell is already cast to text.
     pub rows: Vec<Vec<String>>,
 }
 
@@ -49,13 +49,13 @@ pub struct CellEdit {
     pub col: usize,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Confirm {
     Refresh,
     Quit,
+    Destructive,
 }
 
-/// What the global key layer did with a key.
 enum GlobalKey {
     Quit,
     Handled,
@@ -73,9 +73,7 @@ pub struct OpenPayload {
     pub approx: bool,
 }
 
-/// Result of a background database job. Everything that can block (connect,
-/// catalogue reads, page fetch, count, save, SQL) runs on a spawned task and
-/// reports back here, so the UI keeps drawing and reading keys meanwhile.
+/// Background job result; everything that can block runs on a task and reports back here.
 pub enum Done {
     Connected {
         engine: Arc<Engine>,
@@ -83,7 +81,7 @@ pub enum Done {
         label: String,
         notice: Option<String>,
     },
-    /// table list reload; `opened` re-opens the table that was on screen
+    /// `opened` re-opens the table that was on screen
     Refreshed {
         tables: Vec<String>,
         opened: Option<OpenPayload>,
@@ -96,7 +94,7 @@ pub enum Done {
     },
     Saved {
         msg: String,
-        /// exactly what the job wrote: (pk, col, new value) edits it consumed
+        /// (pk, col, new) edits this job wrote
         edits: Vec<(String, String, String)>,
         dels: Vec<String>,
         ghosts: usize,
@@ -109,19 +107,17 @@ pub struct App {
     form_ta: TextArea<'static>,
     pub engine: Option<Arc<Engine>>,
     done_tx: tokio::sync::mpsc::UnboundedSender<(u64, Done)>,
-    /// a background job is in flight (status line shows a spinner)
     pub busy: bool,
-    /// when the in-flight job started, for the stall watchdog
+    /// Start of the in-flight job, for the stall watchdog.
     busy_since: Option<std::time::Instant>,
-    /// the in-flight job, kept so the user can stop it
+    /// The in-flight job, kept so C-g can stop it.
     job: Option<tokio::task::JoinHandle<()>>,
-    /// current job id; a result with a stale id is dropped
+    /// Current job id; a result with a stale id is dropped.
     job_id: u64,
     job_seq: u64,
-    /// why the last key was refused; drawn only while `busy`
+    /// Why the last key was refused; drawn only while `busy`.
     busy_note: String,
     tables: Vec<String>,
-    /// Some(text) while the sidebar filter is being typed
     filt_in: Option<String>,
     filtered: Vec<String>,
     sb_sel: usize,
@@ -130,7 +126,7 @@ pub struct App {
     pub grid: GridState,
     pub page: usize,
     pub total: usize,
-    /// total is a catalogue estimate, not an exact count
+    /// `total` is a catalogue estimate, not an exact count
     pub approx: bool,
     sort_col: usize,
     sort_desc: bool,
@@ -140,16 +136,19 @@ pub struct App {
     pub pending: PendingUi,
     cell: Option<CellEdit>,
     confirm: Option<Confirm>,
+    /// SQL held from the console until the no-WHERE confirmation is answered
+    pending_sql: Option<String>,
+    /// Profile `readonly = true`: edits and non-row SQL are refused
+    readonly: bool,
+    /// Per-job wall clock from the profile, defaulting to `db::QUERY_BUDGET`
+    budget: std::time::Duration,
     pub msg: String,
     pub err: String,
     pub help: bool,
-    /// database actually opened (shown in the sidebar title)
+    /// Database actually opened, shown in the sidebar title
     label: String,
-    /// what the current connect attempt targets, for the form title
     target: String,
-    /// next frame must repaint every cell: the screen changed shape (form vs
-    /// main UI) or the terminal was resized, and diffed painting would leave
-    /// the previous screen showing through
+    /// Next frame must repaint every cell; a shape change or resize invalidates ratatui's diff.
     pub need_clear: bool,
 }
 
@@ -185,6 +184,9 @@ impl App {
             pending: PendingUi::default(),
             cell: None,
             confirm: None,
+            pending_sql: None,
+            readonly: false,
+            budget: db::QUERY_BUDGET,
             msg: String::new(),
             err: String::new(),
             help: false,
@@ -194,13 +196,13 @@ impl App {
         }
     }
 
-    // run the job under the query budget; always report back, keep the handle
+    // Runs under the job budget and always reports back; C-g can stop it.
     fn spawn_job(&mut self, fut: impl std::future::Future<Output = Done> + Send + 'static) {
         self.busy = true;
         self.busy_since = Some(std::time::Instant::now());
         self.busy_note.clear();
         let id = self.fresh_job_id();
-        let budget = db::QUERY_BUDGET;
+        let budget = self.budget;
         let tx = self.done_tx.clone();
         let handle = tokio::spawn(async move {
             let done = match tokio::time::timeout(budget, fut).await {
@@ -215,7 +217,7 @@ impl App {
         self.job = Some(handle);
     }
 
-    // new job id; also invalidates a stopped job's late result
+    // A new id also invalidates a stopped job's late result.
     fn fresh_job_id(&mut self) -> u64 {
         let id = self.job_seq;
         self.job_seq += 1;
@@ -227,7 +229,7 @@ impl App {
         self.busy_note = format!("{what}: wait, or C-g to stop");
     }
 
-    // drop the job's future; a stopped save usually rolls back
+    // A stopped save usually rolls back, but the server may still finish it.
     fn abort_job(&mut self) {
         if let Some(handle) = self.job.take() {
             handle.abort();
@@ -237,19 +239,18 @@ impl App {
         self.busy_since = None;
     }
 
-    // C-g stop (sqlmux grid.stop: https://github.com/kackerx/sqlmux)
     fn stop_job(&mut self) {
         self.abort_job();
         self.busy_note.clear();
         self.msg = "stopped".into();
     }
 
-    // watchdog: a job that stopped reporting must not block the UI
+    // A job that stopped reporting must not block the UI.
     pub fn tick(&mut self) {
         const SLACK: std::time::Duration = std::time::Duration::from_secs(5);
         if self
             .busy_since
-            .is_some_and(|t0| t0.elapsed() > db::QUERY_BUDGET + SLACK)
+            .is_some_and(|t0| t0.elapsed() > self.budget + SLACK)
         {
             self.abort_job();
             self.err =
@@ -258,10 +259,8 @@ impl App {
         }
     }
 
-    /// Kick off a connect on a background task; returns immediately so the form
-    /// stays visible and redraws while the server is contacted. The DSN itself is
-    /// validated here, so a bad one fails at once instead of after a timeout.
-    pub fn enqueue_connect(&mut self, dsn: &str) {
+    /// Starts a connect on a task; the DSN is validated first, so a bad one fails at once.
+    pub fn enqueue_connect(&mut self, dsn: &str, def: Option<&ConnDef>) {
         if self.busy {
             self.refuse("still connecting");
             return;
@@ -276,14 +275,15 @@ impl App {
                 return;
             }
         };
+        self.readonly = def.is_some_and(ConnDef::is_readonly);
+        self.budget = def.map_or(db::QUERY_BUDGET, ConnDef::timeout);
         self.target = target_label(&conn);
         self.spawn_job(async move {
             let engine = match Engine::connect(&conn).await {
                 Err(err) => return Done::Failed(err),
                 Ok(engine) => Arc::new(engine),
             };
-            // show the database actually opened: Postgres falls back to a DB
-            // named after the user when the DSN omits one
+            // Postgres falls back to a database named after the user when the DSN omits one
             let label = match conn.kind {
                 crate::config::EngineKind::Sqlite => {
                     conn.url.trim_start_matches("sqlite:").to_string()
@@ -324,8 +324,11 @@ impl App {
         self.sb_sel = self.sb_sel.min(self.filtered.len().saturating_sub(1));
     }
 
-    /// Open a table (columns + first page + count) on a background task.
     fn enqueue_open(&mut self, name: &str) {
+        if self.dirty() {
+            self.err = "unsaved edits: C-s saves them, R discards and refreshes".into();
+            return;
+        }
         let Some(engine) = self.engine.clone() else { return };
         if self.busy {
             self.refuse("still loading");
@@ -336,29 +339,32 @@ impl App {
         self.spawn_job(async move { fetch_open(&engine, &name, 0, None).await });
     }
 
-    /// Fetch the current page of the current table with the current sort.
     fn enqueue_page(&mut self) {
-        let (Some(engine), Some(td)) = (self.engine.clone(), self.td.clone()) else { return };
+        let Some(engine) = self.engine.clone() else { return };
         if self.busy {
             self.refuse("still loading");
             return;
         }
         self.err.clear();
+        let Some(td) = self.td.as_ref() else { return };
         let order = if self.sort_col == NONE_SORT {
             None
         } else {
             Some((td.cols[self.sort_col].name.clone(), self.sort_desc))
         };
+        let name = td.name.clone();
+        let cols = td.cols.clone();
         let page = self.page;
+        // Keep the known total; recounting here would run COUNT(*) on every turn.
+        let (total, approx) = (self.total, self.approx);
         self.spawn_job(async move {
-            match fetch_open(&engine, &td.name, page, order).await {
-                Done::Opened(p) => Done::Page { rows: p.td.rows, total: p.total, approx: p.approx },
-                other => other,
+            match engine.fetch_page(&name, &cols, order, PAGE, page * PAGE).await {
+                Ok(p) => Done::Page { rows: p.rows, total, approx },
+                Err(err) => Done::Failed(format!("query: {err}")),
             }
         });
     }
 
-    /// Reload the table list; reopen the current table when there is one.
     fn enqueue_refresh(&mut self) {
         let engine = self.engine.clone();
         let Some(engine) = engine else { return };
@@ -412,7 +418,6 @@ impl App {
         self.enqueue_page();
     }
 
-    // current job finished: apply it and clear the busy state
     pub fn apply(&mut self, done: Done) {
         self.busy = false;
         self.busy_since = None;
@@ -433,12 +438,12 @@ impl App {
             Done::Failed(err) => self.apply_failed(err),
         }
         if was_connected != self.engine.is_some() {
-            // form and main UI occupy different shapes; repaint from scratch
+            // the form and the main UI have different shapes, so repaint from scratch
             self.need_clear = true;
         }
     }
 
-    // drop a result whose job is no longer current (stopped, or already replaced)
+    // A result whose job was replaced or stopped is dropped.
     pub fn apply_job(&mut self, id: u64, done: Done) {
         if id == self.job_id {
             self.apply(done);
@@ -477,6 +482,7 @@ impl App {
     }
 
     fn apply_page(&mut self, rows: Vec<Vec<String>>, total: usize, approx: bool) {
+        self.cell = None;
         self.total = total;
         self.approx = approx;
         if let Some(td) = self.td.as_mut() {
@@ -499,17 +505,19 @@ impl App {
         consumed_ghosts: usize,
     ) {
         self.msg = msg;
-        // remove only what this job wrote: anything typed while it was in flight
-        // stays pending, re-based onto the saved value
+        // Remove only what this job wrote; anything typed meanwhile stays pending.
         for (pk, col, saved) in consumed {
             self.forget_consumed_edit(&pk, &col, &saved);
         }
+        let removed = consumed_dels.len();
         for pk in consumed_dels {
             self.pending.deletes.remove(&pk);
         }
         if consumed_ghosts > 0 && self.pending.drafts.len() >= consumed_ghosts {
             self.pending.drafts.drain(0..consumed_ghosts);
         }
+        // a page fetch does not recount, so adjust the header total here
+        self.total = self.total.saturating_sub(removed).saturating_add(consumed_ghosts);
         self.enqueue_page();
     }
 
@@ -535,7 +543,7 @@ impl App {
     }
 
     fn apply_failed(&mut self, err: String) {
-        // still on the form: say plainly that the connection itself failed
+        // on the form, say that the connection itself failed
         self.err = if self.engine.is_none() && !err.starts_with("list tables") {
             format!("cannot connect: {err}")
         } else {
@@ -547,6 +555,7 @@ impl App {
     }
 
     fn set_opened(&mut self, p: OpenPayload) {
+        self.cell = None;
         self.td = Some(p.td);
         self.page = p.page;
         self.total = p.total;
@@ -576,7 +585,6 @@ impl App {
         Some(cells.get(pk_idx).cloned().unwrap_or_default())
     }
 
-    /// pending edit value for (row,col) if any, else the page value
     fn cell_value(&self, row: usize, col: usize) -> String {
         let td = self.td.as_ref().unwrap();
         let (pk_idx, _) = self.editable_pk().unwrap_or((usize::MAX, ""));
@@ -594,8 +602,13 @@ impl App {
     }
 
     fn open_cell(&mut self) {
+        if self.busy {
+            self.refuse("still loading");
+            return;
+        }
         let (row, col) = self.grid.sel;
-        if row >= self.td.as_ref().map_or(0, |td| td.rows.len()) {
+        let n_rows = self.td.as_ref().map_or(0, |td| td.rows.len());
+        if row >= n_rows {
             // ghost row: only the PK cell is editable before save
             let Some(td) = self.td.as_ref() else { return };
             let Some(pkidx) = td.pk_idx else {
@@ -606,6 +619,10 @@ impl App {
                 self.msg = "ghost rows: save first (C-s), then edit".into();
                 return;
             }
+        } else if self.pk_of_row(row).is_none_or(|s| s.is_empty()) {
+            // an empty key cannot identify the row, and saving would drop the edit
+            self.err = "this row has no primary key value; it cannot be edited".into();
+            return;
         }
         let Some(td) = self.td.as_ref() else { return };
         if td.pk_idx.is_none() {
@@ -622,7 +639,6 @@ impl App {
         let new: String = cell.ta.lines().join("\n");
         let td = self.td.as_ref().unwrap();
         if row >= td.rows.len() {
-            // ghost pk draft
             let gi = row - td.rows.len();
             if gi < self.pending.drafts.len() {
                 self.pending.drafts[gi] = new;
@@ -638,7 +654,7 @@ impl App {
             .cloned()
             .unwrap_or_default();
         let m = self.pending.edits.entry(pk.clone()).or_default();
-        // empty commits '' (NULL and '' look the same in the grid); Esc cancels; :null means a real NULL
+        // An empty commit writes '' (NULL and '' look alike in the grid); `:null` writes a real NULL.
         if new == col_orig && !new.is_empty() {
             m.remove(&col_name);
             if m.is_empty() {
@@ -650,10 +666,14 @@ impl App {
     }
 
     fn toggle_delete(&mut self) {
+        if self.busy {
+            self.refuse("still loading");
+            return;
+        }
         let row = self.grid.sel.0;
         if self.pk_of_row(row).is_none_or(|s| s.is_empty()) {
             if row >= self.td.as_ref().map_or(0, |td| td.rows.len()) {
-                // delete a ghost: just remove it locally
+                // a ghost is only a local draft, so nothing is deleted on the server
                 let gi = row - self.td.as_ref().unwrap().rows.len();
                 self.pending.drafts.remove(gi);
                 
@@ -670,6 +690,10 @@ impl App {
     }
 
     fn add_ghost(&mut self) {
+        if self.busy {
+            self.refuse("still loading");
+            return;
+        }
         if self.editable_pk().is_none() {
             self.err = "adding rows needs a table with a single-column primary key".into();
             return;
@@ -679,6 +703,10 @@ impl App {
     }
 
     fn enqueue_save(&mut self) {
+        if self.readonly {
+            self.err = "this connection is read-only: edits cannot be saved".into();
+            return;
+        }
         if self.busy {
             self.refuse("a save or query is still running");
             return;
@@ -715,8 +743,7 @@ impl App {
             return;
         }
         let (name, pk_name) = (td.name.clone(), pk_name.to_string());
-        // remember precisely what this job takes, so a save landing later does
-        // not wipe edits the user typed while it ran
+        // Remember what this job takes so a later save cannot wipe edits typed meanwhile.
         let consumed_edits: Vec<(String, String, String)> = edits
             .iter()
             .map(|e| (e.pk.clone(), e.col.clone(), e.new.clone()))
@@ -751,7 +778,13 @@ impl App {
             self.refuse("a statement is still running");
             return;
         }
+        let mysql = engine.kind() == EngineKind::MySql;
+        if self.readonly && !db::is_read_sql(sql, mysql) {
+            self.err = "this connection is read-only: only row queries are allowed".into();
+            return;
+        }
         self.err.clear();
+        self.con.push_history(sql.to_string());
         let sql = sql.to_string();
         self.spawn_job(async move {
             match engine.run_sql(&sql).await {
@@ -762,8 +795,16 @@ impl App {
     }
 
     fn export_csv(&mut self) {
+        let Some(name) = self.td.as_ref().map(|td| td.name.clone()) else { return };
+        let path = export_path(&name);
+        if path.exists() {
+            self.err = format!(
+                "export: {} already exists; move or delete it first",
+                path.display()
+            );
+            return;
+        }
         let Some(td) = self.td.as_ref() else { return };
-        let path = format!("./{}.csv", td.name);
         let esc = |v: &str| {
             if v.contains(',') || v.contains('\"') || v.contains('\n') {
                 format!("\"{}\"", v.replace('\"', "\"\""))
@@ -778,7 +819,7 @@ impl App {
             body.push('\n');
         }
         match std::fs::write(&path, body) {
-            Ok(()) => self.msg = format!("exported page → {path}"),
+            Ok(()) => self.msg = format!("exported page → {}", path.display()),
             Err(e) => self.err = format!("export: {e}"),
         }
     }
@@ -792,8 +833,6 @@ impl App {
             Focus::Results => Focus::Sidebar,
         };
     }
-
-    // ---------------------------------------------------------------- events
 
     pub fn handle(&mut self, ev: Event) -> Option<Out> {
         match ev {
@@ -815,13 +854,23 @@ impl App {
         if k.kind != crossterm::event::KeyEventKind::Press {
             return None;
         }
-        // cell edit overlay eats everything
         if self.cell.is_some() {
             return self.cell_key(k);
         }
-        // confirm overlay eats everything
         if let Some(mode) = self.confirm {
             return self.confirm_key(k, mode);
+        }
+        // the help box swallows keys; C-c keeps its usual quit behavior
+        if self.help {
+            if matches!(k.code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.help = false;
+                return None;
+            }
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                self.help = false; // let the quit path ask below
+            } else {
+                return None;
+            }
         }
         match self.global_key(&k) {
             GlobalKey::Quit => return Some(Out::Quit),
@@ -831,7 +880,6 @@ impl App {
         self.focus_key(k)
     }
 
-    /// Dispatch to the focused pane's key handler.
     fn focus_key(&mut self, k: KeyEvent) -> Option<Out> {
         match self.focus {
             Focus::Form => self.form_key(k),
@@ -845,8 +893,15 @@ impl App {
     /// Keys that work from any pane. `Pass` means the focused pane handles it.
     fn global_key(&mut self, k: &KeyEvent) -> GlobalKey {
         match (k.code, k.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => GlobalKey::Quit,
-            // stop a job that is still running (sqlmux's grid.stop)
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                // the same guard as q: a pending edit survives a stray C-c
+                if self.dirty() {
+                    self.confirm = Some(Confirm::Quit);
+                    GlobalKey::Handled
+                } else {
+                    GlobalKey::Quit
+                }
+            }
             (KeyCode::Char('g'), KeyModifiers::CONTROL) if self.busy => {
                 self.stop_job();
                 GlobalKey::Handled
@@ -879,8 +934,6 @@ impl App {
         }
     }
 
-    /// Keys for the cell overlay: Enter commits, Esc cancels, everything else
-    /// types into the one-line textarea.
     fn cell_key(&mut self, k: KeyEvent) -> Option<Out> {
         match k.code {
             KeyCode::Enter => self.accept_cell(),
@@ -894,8 +947,7 @@ impl App {
         None
     }
 
-    /// Keys while a confirm box is up. Some(Quit) means yes to the quit prompt;
-    /// every other key is consumed by the prompt.
+    /// Only `y` accepts, plus Enter for the refresh prompt.
     fn confirm_key(&mut self, k: KeyEvent, mode: Confirm) -> Option<Out> {
         let yes = k.code == KeyCode::Char('y')
             || (k.code == KeyCode::Enter && mode == Confirm::Refresh);
@@ -907,11 +959,18 @@ impl App {
                     self.enqueue_refresh();
                 }
                 Confirm::Quit => return Some(Out::Quit),
+                Confirm::Destructive => {
+                    self.confirm = None;
+                    if let Some(sql) = self.pending_sql.take() {
+                        self.enqueue_run_sql(&sql);
+                    }
+                }
             }
             return None;
         }
         if matches!(k.code, KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q')) {
             self.confirm = None;
+            self.pending_sql = None;
         }
         None
     }
@@ -920,7 +979,7 @@ impl App {
         match k.code {
             KeyCode::Enter => {
                 let dsn = self.form_ta.lines().join("");
-                self.enqueue_connect(&dsn);
+                self.enqueue_connect(&dsn, None);
             }
             _ => {
                 self.form_ta.input(k);
@@ -1015,7 +1074,6 @@ impl App {
     fn editor_key(&mut self, k: KeyEvent) -> Option<Out> {
         match k.code {
             KeyCode::Esc => self.focus = Focus::Grid,
-            // recall history: Alt-Up/Down or C-p/C-n (works everywhere)
             KeyCode::Up
                 if k.modifiers.contains(KeyModifiers::ALT)
                     || k.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1030,10 +1088,15 @@ impl App {
             }
             KeyCode::Enter if k.modifiers.is_empty() => {
                 let sql = self.con.sql();
-                self.con.push_history(sql.clone());
-                self.enqueue_run_sql(&sql);
+                // a statement that would rewrite or empty a table gets a y/N
+                let mysql = self.engine.as_ref().is_some_and(|e| e.kind() == EngineKind::MySql);
+                if db::destructive_without_where(&sql, mysql) {
+                    self.pending_sql = Some(sql);
+                    self.confirm = Some(Confirm::Destructive);
+                } else {
+                    self.enqueue_run_sql(&sql);
+                }
             }
-            // C-f: reformat the buffer with sqlformat
             KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let sql = self.con.sql();
                 let pretty = sqlformat::format(
@@ -1064,6 +1127,9 @@ impl App {
     }
 
     fn mouse(&mut self, m: crossterm::event::MouseEvent) {
+        if self.help || self.confirm.is_some() {
+            return;
+        }
         let delta = match m.kind {
             MouseEventKind::ScrollUp => Some(-3),
             MouseEventKind::ScrollDown => Some(3),
@@ -1088,8 +1154,6 @@ impl App {
             }
         }
     }
-
-    // ------------------------------------------------------------------ draw
 
     pub fn draw(&mut self, f: &mut Frame) {
         if self.engine.is_none() {
@@ -1159,10 +1223,11 @@ impl App {
         let title = match &self.filt_in {
             Some(s) => format!("/ {s}▏"),
             None => {
+                let ro = if self.readonly { " [read-only]" } else { "" };
                 if self.label.is_empty() {
-                    format!("tables ({})", self.filtered.len())
+                    format!("tables ({}){ro}", self.filtered.len())
                 } else {
-                    format!("tables ({}): {}", self.filtered.len(), self.label)
+                    format!("tables ({}): {}{ro}", self.filtered.len(), self.label)
                 }
             }
         };
@@ -1302,7 +1367,6 @@ impl App {
         )
     }
 
-    /// The error or status message at the right of the status line.
     fn status_note(&self, width: u16) -> Span<'static> {
         let (mark, text, color) = if !self.err.is_empty() {
             ("⚠", self.err.chars().take(width.saturating_sub(2) as usize).collect::<String>(), Color::Red)
@@ -1333,8 +1397,17 @@ impl App {
     fn draw_confirm(&mut self, f: &mut Frame) {
         let mode = self.confirm.unwrap_or(Confirm::Refresh);
         let txt = match mode {
-            Confirm::Refresh => "discard unsaved changes and refresh? [y/N]",
-            Confirm::Quit => "discard unsaved changes and quit? [y/N]",
+            Confirm::Refresh => "discard unsaved changes and refresh? [y/N]".to_string(),
+            Confirm::Quit => "discard unsaved changes and quit? [y/N]".to_string(),
+            Confirm::Destructive => {
+                let kw = self
+                    .pending_sql
+                    .as_deref()
+                    .and_then(|s| s.split_whitespace().next())
+                    .map(str::to_ascii_uppercase)
+                    .unwrap_or_else(|| "statement".into());
+                format!("run {kw} with no WHERE clause? [y/N]")
+            }
         };
         let area = centered(f.area(), 46, 5);
         f.render_widget(ratatui::widgets::Clear, area);
@@ -1351,7 +1424,15 @@ impl App {
     }
 }
 
-/// Human-readable target for the connect form title.
+/// A safe file stem in the working directory, so `..` cannot escape it.
+fn export_path(table: &str) -> std::path::PathBuf {
+    let stem: String = table
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    std::path::PathBuf::from(format!("{stem}.csv"))
+}
+
 fn target_label(conn: &Conn) -> String {
     match conn.kind {
         crate::config::EngineKind::Postgres => "postgres".into(),
@@ -1371,8 +1452,7 @@ fn centered(r: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-/// The row identity: only a single-column pk is editable, so a composite key
-/// stays read-only instead of matching rows on the first column alone.
+/// Only a single-column pk is editable; a composite key stays read-only.
 fn pk_index(cols: &[db::Col]) -> Option<usize> {
     let mut pks = cols.iter().enumerate().filter(|(_, c)| c.pk).map(|(i, _)| i);
     match (pks.next(), pks.next()) {
@@ -1381,7 +1461,7 @@ fn pk_index(cols: &[db::Col]) -> Option<usize> {
     }
 }
 
-/// Catalogue + first/next page + best count for one table; runs on a task.
+/// Catalogue, one page and the count for one table, as a background job.
 async fn fetch_open(
     engine: &Arc<Engine>,
     name: &str,
@@ -1424,9 +1504,9 @@ mod tests {
         app.td = Some(TableData {
             name: "t".into(),
             cols: vec![
-                db::Col { name: "id".into(), data_type: "int".into(), pk: true },
-                db::Col { name: "name".into(), data_type: "text".into(), pk: false },
-                db::Col { name: "score".into(), data_type: "real".into(), pk: false },
+                db::Col { name: "id".into(), pk: true },
+                db::Col { name: "name".into(), pk: false },
+                db::Col { name: "score".into(), pk: false },
             ],
             pk_idx: Some(0),
             rows: vec![vec!["1".into(), "a".into(), "1".into()]],
@@ -1438,7 +1518,7 @@ mod tests {
     async fn save_result_keeps_edits_typed_while_it_ran() {
         let mut app = app_with_row();
         let mut row = std::collections::BTreeMap::new();
-        // this one the job wrote: same new value, so it is consumed
+        // the job wrote this one, so it is consumed
         row.insert("name".to_string(), ("a".to_string(), "saved".to_string()));
         // this one was typed while the job ran: kept, re-based on the saved value
         row.insert("score".to_string(), ("1".to_string(), "3".to_string()));
@@ -1455,7 +1535,6 @@ mod tests {
         let kept = app.pending.edits.get("1").expect("row keeps its later edit");
         assert!(!kept.contains_key("name"), "consumed edit is removed");
         assert_eq!(kept["score"], ("1".to_string(), "3".to_string()));
-        // the saved ghost is gone, the one added afterwards stays
         assert_eq!(app.pending.drafts, vec!["8".to_string()]);
     }
 
@@ -1531,10 +1610,146 @@ mod tests {
         assert!(!app.err.contains("late"), "{}", app.err);
     }
 
+    #[tokio::test]
+    async fn a_saved_delete_updates_the_total() {
+        let mut app = app_with_row();
+        app.total = 5;
+        app.apply(Done::Saved {
+            msg: "ok".into(),
+            edits: vec![],
+            dels: vec!["1".into()],
+            ghosts: 2,
+        });
+        assert_eq!(app.total, 6, "5 rows minus one delete plus two inserts");
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_where_asks_first() {
+        let mut app = app_with_row();
+        app.focus = Focus::Editor;
+        app.con.set_text("delete from t");
+        app.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+        assert_eq!(app.confirm, Some(Confirm::Destructive));
+        assert_eq!(app.pending_sql.as_deref(), Some("delete from t"));
+
+        app.handle(Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert_eq!(app.confirm, None);
+        assert!(app.pending_sql.is_none(), "no is not a queued statement");
+    }
+
+    #[test]
+    fn export_path_cannot_escape_the_working_directory() {
+        assert_eq!(export_path("users"), std::path::PathBuf::from("users.csv"));
+        assert_eq!(
+            export_path("../../etc/passwd"),
+            std::path::PathBuf::from("______etc_passwd.csv")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_with_pending_edits_does_not_open_silently() {
+        let mut app = app_with_row();
+        app.pending.edits.insert(
+            "1".into(),
+            std::collections::BTreeMap::from([(
+                "name".to_string(),
+                ("a".to_string(), "b".to_string()),
+            )]),
+        );
+        app.enqueue_open("other");
+        assert!(app.err.contains("unsaved"), "{}", app.err);
+        assert!(!app.pending.edits.is_empty(), "the edit is still there");
+    }
+
+    #[tokio::test]
+    async fn opening_a_table_closes_the_cell_editor() {
+        let mut app = app_with_row();
+        app.cell = Some(CellEdit { ta: TextArea::new(vec![]), row: 0, col: 2 });
+        app.apply(Done::Opened(OpenPayload {
+            td: TableData {
+                name: "narrow".into(),
+                cols: vec![db::Col { name: "id".into(), pk: true }],
+                pk_idx: Some(0),
+                rows: vec![],
+            },
+            page: 0,
+            total: 0,
+            approx: false,
+        }));
+        assert!(app.cell.is_none(), "an overlay from the old table must not survive");
+    }
+
+    #[tokio::test]
+    async fn the_help_box_swallows_editing_keys() {
+        let mut app = app_with_row();
+        app.focus = Focus::Grid;
+        app.help = true;
+        app.handle(Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+        assert!(app.pending.deletes.is_empty(), "d must not reach the grid");
+        app.handle(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.help, "Esc closes the help box");
+    }
+
+    #[tokio::test]
+    async fn a_running_job_blocks_new_pending_edits() {
+        let mut app = app_with_row();
+        app.busy = true;
+        app.grid.sel = (0, 1);
+        app.open_cell();
+        assert!(app.cell.is_none());
+        app.toggle_delete();
+        assert!(app.pending.deletes.is_empty());
+        app.add_ghost();
+        assert!(app.pending.drafts.is_empty());
+        assert!(app.busy_note.contains("still loading"));
+    }
+
+    #[tokio::test]
+    async fn a_row_without_a_pk_value_cannot_be_edited() {
+        let mut app = app_with_row();
+        app.td.as_mut().unwrap().rows[0][0] = String::new();
+        app.grid.sel = (0, 1);
+        app.open_cell();
+        assert!(app.cell.is_none());
+        assert!(app.err.contains("no primary key"), "{}", app.err);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_asks_before_discarding_edits() {
+        let mut dirty = app_with_row();
+        dirty.pending.edits.insert(
+            "1".into(),
+            std::collections::BTreeMap::from([(
+                "name".to_string(),
+                ("a".to_string(), "b".to_string()),
+            )]),
+        );
+        let out = dirty.handle(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(out.is_none(), "the first C-c only asks");
+        assert_eq!(dirty.confirm, Some(Confirm::Quit));
+        assert!(matches!(
+            dirty.handle(Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))),
+            Some(Out::Quit)
+        ));
+
+        let mut clean = app_with_row();
+        assert!(matches!(
+            clean.handle(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            Some(Out::Quit)
+        ));
+    }
+
     #[test]
     fn a_composite_pk_is_read_only() {
-        let pk = |name: &str| db::Col { name: name.into(), data_type: "int".into(), pk: true };
-        let npk = || db::Col { name: "v".into(), data_type: "int".into(), pk: false };
+        let pk = |name: &str| db::Col { name: name.into(), pk: true };
+        let npk = || db::Col { name: "v".into(), pk: false };
         assert_eq!(pk_index(&[]), None);
         assert_eq!(pk_index(&[npk()]), None, "no pk at all");
         assert_eq!(pk_index(&[pk("a"), npk()]), Some(0));

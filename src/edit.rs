@@ -1,6 +1,6 @@
 use crate::config::EngineKind;
 
-/// identifier quoting: doubles the quote char instead of trusting the SQL layer.
+/// Doubles the quote char instead of trusting the SQL layer.
 pub fn quote_ident(k: EngineKind, s: &str) -> String {
     match k {
         EngineKind::MySql => format!("`{}`", s.replace('`', "``")),
@@ -8,12 +8,13 @@ pub fn quote_ident(k: EngineKind, s: &str) -> String {
     }
 }
 
-/// value literal quoting. shortcut: everything ships as a quoted string and the
-/// server coerces (SQLite affinity, MySQL implicit cast, PG unknown-type
-/// coercion). Numbers-as-strings can therefore round-trip `1.50` as text into a
-/// REAL column; when precision packaging matters, add a typed-literal path.
-pub fn quote_literal(v: &str) -> String {
-    format!("'{}'", v.replace('\'', "''"))
+/// MySQL needs backslashes doubled; every value ships as text, so `1.50` can land in a REAL column as text.
+pub fn quote_literal(k: EngineKind, v: &str) -> String {
+    let esc = match k {
+        EngineKind::MySql => v.replace('\\', "\\\\").replace('\'', "''"),
+        _ => v.replace('\'', "''"),
+    };
+    format!("'{esc}'")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +30,6 @@ pub struct Edit {
 pub struct Report {
     pub updates: usize,
     pub deletes: usize,
-    /// PK text values of rows INSERT'd during save
     pub inserts: Vec<String>,
 }
 
@@ -47,10 +47,19 @@ mod tests {
 
     #[test]
     fn literal_quoting() {
-        assert_eq!(quote_literal("0'Conr"), "'0''Conr'");
-        assert_eq!(quote_literal("'; DROP TABLE u;--"), "'''; DROP TABLE u;--'");
+        assert_eq!(quote_literal(Sqlite, "0'Conr"), "'0''Conr'");
+        assert_eq!(quote_literal(Sqlite, "'; DROP TABLE u;--"), "'''; DROP TABLE u;--'");
         // an embedded quote is always doubled, so it can never end the literal
-        assert_eq!(quote_literal("x'"), "'x'''");
-        assert_eq!(quote_literal(""), "''");
+        assert_eq!(quote_literal(Sqlite, "x'"), "'x'''");
+        assert_eq!(quote_literal(Sqlite, ""), "''");
+    }
+
+    #[test]
+    fn mysql_doubles_a_backslash_so_it_cannot_escape_the_quote() {
+        assert_eq!(quote_literal(MySql, r"a\'b"), r"'a\\''b'");
+        // the payload that used to close the string and comment out the WHERE
+        let sql = format!("UPDATE t SET c = {}", quote_literal(MySql, r"\' OR 1=1 -- "));
+        assert!(sql.contains(r"\\'' OR 1=1"), "{sql}");
+        assert_eq!(quote_literal(Sqlite, r"a\'b"), r"'a\''b'");
     }
 }

@@ -4,13 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ui;
 
-/// Everything the grid needs to show unsaved work.
 #[derive(Default)]
 pub struct PendingUi {
     /// pk cell text -> col name -> (orig, new)
     pub edits: BTreeMap<String, BTreeMap<String, (String, String)>>,
     pub deletes: BTreeSet<String>,
-    /// pending inserted rows, each carrying the pk draft typed onto it
+    /// pending inserts, each carrying the pk draft typed onto it
     pub drafts: Vec<String>,
 }
 
@@ -18,7 +17,7 @@ pub struct PendingUi {
 pub struct GridState {
     /// (row into rows (+drafts), col into cols)
     pub sel: (usize, usize),
-    /// first visible column (kept in sync by render)
+    /// first scrolled column (1 or more: column 0 is frozen)
     pub col_off: usize,
     pub table_state: TableState,
 }
@@ -46,7 +45,6 @@ impl GridState {
     }
 }
 
-/// Width per column: widest of header/cells, capped.
 fn col_widths(cols: &[String], rows: &[Vec<String>]) -> Vec<usize> {
     cols.iter()
         .enumerate()
@@ -62,7 +60,6 @@ fn col_widths(cols: &[String], rows: &[Vec<String>]) -> Vec<usize> {
         .collect()
 }
 
-/// Window [start..end) of columns that fits `budget`, starting at `start`.
 fn fit_forward(widths: &[usize], budget: usize, start: usize) -> (usize, usize) {
     let mut end = start;
     let mut used = 0;
@@ -77,8 +74,6 @@ fn fit_forward(widths: &[usize], budget: usize, start: usize) -> (usize, usize) 
     (start, end.max(start + 1).min(widths.len()))
 }
 
-/// Window ending at column `last`, grown backwards. Used when the cursor moves
-/// left out of view.
 fn fit_back(widths: &[usize], budget: usize, last: usize) -> (usize, usize) {
     let mut start = last;
     let mut used = widths[start];
@@ -89,7 +84,6 @@ fn fit_back(widths: &[usize], budget: usize, last: usize) -> (usize, usize) {
     fit_forward(widths, budget, start)
 }
 
-/// The visible column window: keep `sel` inside, sliding from `col_off`.
 fn pick_window(widths: &[usize], budget: usize, sel: usize, col_off: usize) -> (usize, usize) {
     let win = fit_forward(widths, budget, col_off);
     if sel < win.0 {
@@ -101,7 +95,19 @@ fn pick_window(widths: &[usize], budget: usize, sel: usize, col_off: usize) -> (
     }
 }
 
-/// What the row builders need to know to style cells.
+/// Column 0 is frozen; the rest scroll in the width it leaves.
+fn visible_cols(widths: &[usize], budget: usize, sel: usize, col_off: usize) -> Vec<usize> {
+    let avail = budget.saturating_sub(widths[0]);
+    let (start, end) = if sel == 0 {
+        fit_forward(widths, avail, col_off.max(1).min(widths.len()))
+    } else {
+        let off = col_off.saturating_sub(1).min(widths.len() - 1);
+        let (s, e) = pick_window(&widths[1..], avail, sel - 1, off);
+        (s + 1, e + 1)
+    };
+    std::iter::once(0).chain(start..end).collect()
+}
+
 struct RowCtx<'a> {
     cols: &'a [String],
     win: &'a [usize],
@@ -110,7 +116,6 @@ struct RowCtx<'a> {
     sel: (usize, usize),
 }
 
-/// One data row, with deleted / edited / cursor styling applied.
 fn data_row(row: &[String], ri: usize, ctx: &RowCtx<'_>) -> Row<'static> {
     let pk = ctx.pk_idx.and_then(|p| row.get(p).cloned()).unwrap_or_default();
     let is_del = ctx.pending.deletes.contains(&pk);
@@ -139,7 +144,7 @@ fn data_row(row: &[String], ri: usize, ctx: &RowCtx<'_>) -> Row<'static> {
     Row::new(cells)
 }
 
-/// One pending-insert row: the pk draft shows yellow, other cells stay empty.
+/// A pending insert shows only its PK draft; the other cells stay empty.
 fn ghost_row(gi: usize, data_len: usize, ctx: &RowCtx<'_>) -> Row<'static> {
     let draft = ctx.pending.drafts.get(gi).cloned().unwrap_or_default();
     let cells: Vec<Cell> = ctx
@@ -180,9 +185,8 @@ pub fn render(
     }
     let widths = col_widths(cols, rows);
     let budget = area.width.saturating_sub(2) as usize;
-    let (start, end) = pick_window(&widths, budget, st.sel.1, st.col_off);
-    st.col_off = start;
-    let win: Vec<usize> = (start..end).collect();
+    let win = visible_cols(&widths, budget, st.sel.1, st.col_off);
+    st.col_off = win.get(1).copied().unwrap_or(1);
     let hidden = cols.len() - win.len();
     let title = if hidden > 0 {
         format!("{title} (+{hidden} cols)")
@@ -244,7 +248,7 @@ mod tests {
     #[test]
     fn a_selection_right_of_the_window_slides_forward_into_view() {
         let widths = [10, 10, 10, 10];
-        let win = pick_window(&widths, 10, 3, 0); // budget fits one column; select the 4th
+        let win = pick_window(&widths, 10, 3, 0);
         assert_eq!(win, (3, 4));
         assert!(inside(win, 3));
     }
@@ -260,7 +264,7 @@ mod tests {
     #[test]
     fn a_column_wider_than_the_budget_still_shows_and_covers_itself() {
         let widths = [40, 5];
-        let win = pick_window(&widths, 10, 0, 0); // column 0 alone exceeds the budget
+        let win = pick_window(&widths, 10, 0, 0);
         assert_eq!(win, (0, 1));
         assert!(inside(win, 0));
     }
@@ -271,5 +275,21 @@ mod tests {
         let win = pick_window(&widths, 10, 2, 0);
         assert!(inside(win, 2), "{win:?}");
         assert!(win.1 <= widths.len());
+    }
+
+    #[test]
+    fn the_first_column_stays_frozen_while_the_rest_scroll() {
+        let widths = [10, 10, 10, 10];
+        let win = visible_cols(&widths, 30, 3, 0);
+        assert_eq!(win, vec![0, 3], "the selection slides into view, column 0 stays");
+        let win = visible_cols(&widths, 30, 0, 3);
+        assert_eq!(win, vec![0, 3]);
+        assert_eq!(visible_cols(&[10], 30, 0, 0), vec![0]);
+    }
+
+    #[test]
+    fn a_window_that_fits_keeps_every_column_exactly_once() {
+        let widths = [5, 5, 5];
+        assert_eq!(visible_cols(&widths, 100, 2, 0), vec![0, 1, 2]);
     }
 }
