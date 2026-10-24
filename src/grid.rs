@@ -55,7 +55,7 @@ fn col_widths(cols: &[String], rows: &[Vec<String>]) -> Vec<usize> {
                     w = w.max(v.chars().count());
                 }
             }
-            (w + 2).min(34)
+            (w + 2).min(35)
         })
         .collect()
 }
@@ -122,7 +122,8 @@ fn data_row(row: &[String], ri: usize, ctx: &RowCtx<'_>) -> Row<'static> {
     let cells: Vec<Cell> = ctx
         .win
         .iter()
-        .map(|&ci| {
+        .enumerate()
+        .map(|(pos, &ci)| {
             let txt = row.get(ci).cloned().unwrap_or_default();
             let mut style = Style::default();
             if is_del {
@@ -138,7 +139,7 @@ fn data_row(row: &[String], ri: usize, ctx: &RowCtx<'_>) -> Row<'static> {
             if (ri, ci) == ctx.sel {
                 style = style.bg(Color::Rgb(80, 80, 80));
             }
-            Cell::from(txt).style(style)
+            Cell::from(with_sep(pos, txt)).style(style)
         })
         .collect();
     Row::new(cells)
@@ -150,17 +151,23 @@ fn ghost_row(gi: usize, data_len: usize, ctx: &RowCtx<'_>) -> Row<'static> {
     let cells: Vec<Cell> = ctx
         .win
         .iter()
-        .map(|&ci| {
+        .enumerate()
+        .map(|(pos, &ci)| {
             let is_pk = ctx.pk_idx == Some(ci);
             let txt = if is_pk { draft.clone() } else { String::new() };
             let mut style = Style::default().fg(Color::Yellow).italic();
             if is_pk && ctx.sel.0 == data_len + gi {
                 style = style.bg(Color::Rgb(80, 80, 80));
             }
-            Cell::from(txt).style(style)
+            Cell::from(with_sep(pos, txt)).style(style)
         })
         .collect();
     Row::new(cells)
+}
+
+/// A divider between columns, taken from the padding each width already reserves.
+fn with_sep(pos: usize, txt: String) -> String {
+    if pos == 0 { txt } else { format!("│{txt}") }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,13 +203,14 @@ pub fn render(
 
     let header: Vec<Cell> = win
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(pos, &i)| {
             let name = if Some(i) == pk_idx {
                 format!("*{}", cols[i])
             } else {
                 cols[i].clone()
             };
-            Cell::from(name).style(Style::default().fg(Color::Black).bg(Color::Gray))
+            Cell::from(with_sep(pos, name)).style(Style::default().fg(Color::Black).bg(Color::Gray))
         })
         .collect();
 
@@ -232,6 +240,12 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).map_or(' ', |c| c.symbol().chars().next().unwrap_or(' ')))
+            .collect()
+    }
 
     // the selection must stay inside the window; a regression only shows on screen
     fn inside(win: (usize, usize), sel: usize) -> bool {
@@ -291,5 +305,47 @@ mod tests {
     fn a_window_that_fits_keeps_every_column_exactly_once() {
         let widths = [5, 5, 5];
         assert_eq!(visible_cols(&widths, 100, 2, 0), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_divider_sits_between_columns() {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let mut st = GridState::default();
+        let pending = PendingUi::default();
+        let cols = ["a".to_string(), "b".to_string()];
+        let rows = vec![vec!["1".to_string(), "2".to_string()]];
+        term.draw(|f| {
+            render(f, f.area(), "t".into(), false, &cols, &rows, None, &pending, &mut st);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let head = row_text(buf, 1);
+        assert!(head.starts_with("│a  │b"), "{head}");
+        let row = row_text(buf, 2);
+        assert!(row.starts_with("│1  │2"), "{row}");
+    }
+
+    #[test]
+    fn a_scrolled_window_keeps_the_frozen_column_clean() {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(12, 5)).unwrap();
+        let mut st = GridState { sel: (0, 2), ..Default::default() };
+        let pending = PendingUi::default();
+        let cols = ["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let rows = vec![vec!["111".to_string(), "222".to_string(), "333".to_string()]];
+        term.draw(|f| {
+            render(f, f.area(), "t".into(), false, &cols, &rows, None, &pending, &mut st);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let head = row_text(buf, 1);
+        assert!(head.starts_with("│aaa"), "{head}");
+        assert!(head.contains("aaa  │ccc"), "{head}");
+        let row = row_text(buf, 2);
+        assert!(row.starts_with("│111"), "{row}");
+        assert!(row.contains("111  │333"), "{row}");
     }
 }
