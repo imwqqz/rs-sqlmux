@@ -1461,7 +1461,6 @@ fn pk_index(cols: &[db::Col]) -> Option<usize> {
     }
 }
 
-/// Catalogue, one page and the count for one table, as a background job.
 async fn fetch_open(
     engine: &Arc<Engine>,
     name: &str,

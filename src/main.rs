@@ -101,7 +101,6 @@ async fn run(
     }
 }
 
-// a result whose job was replaced is dropped
 fn apply_jobs(
     done_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, app::Done)>,
     app: &mut App,

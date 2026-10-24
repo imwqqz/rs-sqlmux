@@ -300,7 +300,7 @@ mod tests {
             "postgres://user@",
             "postgresql:///db",
             "mysql://",
-            "postgrs://localhost/db", // typo: URL shape, unknown scheme
+            "postgrs://localhost/db",
             "not a dsn at all",
         ] {
             assert!(Conn::from_dsn(bad).is_err(), "should reject {bad:?}");
